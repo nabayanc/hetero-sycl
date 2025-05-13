@@ -1,49 +1,144 @@
 // apps/createcsr/createcsr.cpp
-#include <bits/stdc++.h>
+#include <bits/stdc++.h> // Includes most standard headers (iostream, vector, string, fstream, random, iomanip, cmath, tuple, algorithm, stdexcept)
 #include <getopt.h>
 
 int main(int argc, char** argv) {
-  int rows=0, cols=0;
-  double density=0;
+  int rows = 0, cols = 0;
+  double density = 0;
   std::string outfile;
+  bool make_diagonally_dominant = false; // New option
+
+  // Adding D for --diag_dominant
   static struct option opts[] = {
     {"rows",    required_argument, 0, 'r'},
     {"cols",    required_argument, 0, 'c'},
     {"density", required_argument, 0, 'd'},
     {"output",  required_argument, 0, 'o'},
+    {"diag_dominant", no_argument, 0, 'D'}, // New flag
     {0,0,0,0}
   };
-  int opt;
-  while((opt = getopt_long(argc, argv, "r:c:d:o:", opts, nullptr)) != -1){
-    switch(opt){
+
+  int opt_char;
+  // Added 'D' to getopt_long string
+  while((opt_char = getopt_long(argc, argv, "r:c:d:o:D", opts, nullptr)) != -1){
+    switch(opt_char){
       case 'r': rows    = std::stoi(optarg); break;
       case 'c': cols    = std::stoi(optarg); break;
       case 'd': density = std::stod(optarg); break;
       case 'o': outfile = optarg;           break;
-      default: std::cerr<<"Usage: createcsr --rows R --cols C --density D --output F\n"; return 1;
+      case 'D': make_diagonally_dominant = true; break; // Set the flag
+      default: 
+        std::cerr << "Usage: createcsr --rows R --cols C --density D --output F [--diag_dominant|-D]\n"; 
+        return 1;
     }
   }
-  if(rows<=0||cols<=0||density<=0||outfile.empty()){
-    std::cerr<<"Invalid args\n"; return 1;
+
+  if (rows <= 0 || cols <= 0 || outfile.empty() || density < 0.0 || density > 1.0) {
+    std::cerr << "Error: Invalid or missing required arguments.\n"
+              << "Ensure --rows > 0, --cols > 0, --output is set, and 0.0 <= --density <= 1.0.\n";
+    std::cerr << "Usage: createcsr --rows R --cols C --density D --output F [--diag_dominant|-D]\n";
+    return 1;
+  }
+
+  if (make_diagonally_dominant && rows != cols) {
+    std::cerr << "Error: For --diag_dominant option, matrix must be square (rows == cols)." << std::endl;
+    return 1;
   }
 
   std::mt19937_64 rng(std::random_device{}());
-  std::uniform_real_distribution<double> ud(0.0,1.0);
+  std::uniform_real_distribution<double> ud(0.0, 1.0); // For probabilities and values [0,1)
 
-  std::ofstream out(outfile);
-  out<<"%%MatrixMarket matrix coordinate real general\n";
-  out<<rows<<" "<<cols<<" ";
-  // estimate nnz
-  size_t nnz_est = size_t(rows)*size_t(cols)*density;
-  out<<nnz_est<<"\n";
+  std::vector<std::tuple<int, int, double>> triples;
 
-  for(int i=0;i<rows;++i){
-    for(int j=0;j<cols;++j){
-      if(ud(rng) < density){
-        double v = ud(rng);
-        out<< (i+1) <<" "<< (j+1) <<" "<< v <<"\n";
-      }
+  if (make_diagonally_dominant) {
+    std::cout << "Generating a diagonally dominant sparse matrix (" << rows << "x" << cols << ", density for off-diagonals: " << density << ")" << std::endl;
+    for (int i = 0; i < rows; ++i) {
+        double current_row_sum_abs_off_diag = 0.0;
+        std::vector<std::tuple<int, int, double>> off_diag_elements_in_row;
+
+        // Generate off-diagonal elements for row i
+        for (int j = 0; j < cols; ++j) {
+            if (i == j) continue; // Skip diagonal element for this pass
+
+            if (ud(rng) < density) { // Chance to place an off-diagonal element
+                double val = 2.0 * ud(rng) - 1.0; // Random value between -1.0 and 1.0
+                // Ensure truly non-zero if it's meant to be an entry, to avoid issues with sum_abs
+                if (std::fabs(val) < 1e-9) { 
+                    val = (ud(rng) > 0.5 ? 1e-9 : -1e-9); // Small non-zero
+                }
+                off_diag_elements_in_row.emplace_back(i + 1, j + 1, val);
+                current_row_sum_abs_off_diag += std::abs(val);
+            }
+        }
+
+        // Determine and add the diagonal element for row i
+        // Make diagonal strictly dominant and positive. A_ii = S_i + random_positive_offset
+        // random_positive_offset is in [0.1, 1.0) to ensure strict dominance even if S_i is 0
+        double random_positive_offset = (ud(rng) * 0.9 + 0.1); 
+        double diag_val = current_row_sum_abs_off_diag + random_positive_offset;
+        
+        triples.emplace_back(i + 1, i + 1, diag_val);
+
+        // Add the stored off-diagonal elements for this row
+        for (const auto& tpl : off_diag_elements_in_row) {
+            triples.push_back(tpl);
+        }
+    }
+  } else {
+    // Original random generation logic (density applies to all elements)
+    std::cout << "Generating a general random sparse matrix (" << rows << "x" << cols << ", overall density: " << density << ")" << std::endl;
+    for(int i = 0; i < rows; ++i) {
+        for(int j = 0; j < cols; ++j) {
+            if(ud(rng) < density) {
+                double val = 2.0 * ud(rng) - 1.0; // Random value between -1.0 and 1.0
+                 if (std::abs(val) < 1e-9) { // Avoid exact zero for a non-zero entry
+                    val = (ud(rng) > 0.5 ? 1e-9 : -1e-9); // Small non-zero
+                }
+                triples.emplace_back(i + 1, j + 1, val);
+            }
+        }
     }
   }
+
+  // Write to file
+  std::ofstream out(outfile);
+  if (!out.is_open()) {
+      std::cerr << "Error: Could not open output file " << outfile << std::endl;
+      return 1;
+  }
+
+  out << "%%MatrixMarket matrix coordinate real general\n";
+  if (make_diagonally_dominant) {
+      out << "% Diagonally dominant matrix generated by createcsr\n";
+      out << "% Target density for off-diagonal elements was: " << density << "\n";
+  } else {
+      out << "% General random matrix generated by createcsr\n";
+      out << "% Target overall density was: " << density << "\n";
+  }
+  // Write actual number of non-zeros
+  out << rows << " " << cols << " " << triples.size() << "\n"; 
+
+  // Sort triples for a more standard MatrixMarket output.
+  // Sorting by row, then by column.
+  std::sort(triples.begin(), triples.end(), 
+    [](const std::tuple<int, int, double>& a, const std::tuple<int, int, double>& b) {
+    // Compare first elements (rows)
+    if (std::get<0>(a) != std::get<0>(b)) {
+        return std::get<0>(a) < std::get<0>(b);
+    }
+    // If rows are equal, compare second elements (cols)
+    return std::get<1>(a) < std::get<1>(b);
+  });
+
+  // Output the sorted triples
+  for (const auto& tpl : triples) {
+    out << std::get<0>(tpl) << " "      // Get 0th element (row)
+        << std::get<1>(tpl) << " "      // Get 1st element (col)
+        << std::fixed << std::setprecision(17) << std::get<2>(tpl) << "\n"; // Get 2nd element (value)
+  }
+  out.close();
+  std::cout << "Matrix successfully written to " << outfile << " with " << triples.size() << " non-zero entries." << std::endl;
+
   return 0;
 }
+

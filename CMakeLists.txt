@@ -59,5 +59,6 @@ target_link_libraries(createcsr PRIVATE OpenMP::OpenMP_CXX)
 # -------------------------------------------------------------------- #
 add_subdirectory(src)
 add_subdirectory(apps/spmv_cli)
+add_subdirectory(apps/spmv_bicgstab)
 enable_testing()
 add_subdirectory(tests)
