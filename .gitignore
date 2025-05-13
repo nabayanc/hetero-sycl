@@ -3,3 +3,6 @@ benchmarks_new/
 RESULT_DIR/
 build/
 benchmarks_bicgstab/
+DATASETS/
+EXPERIMENTS/
+PLOTS/
