@@ -11,7 +11,8 @@ DATASETS_DIR="DATASETS"
 
 # Root directory for storing all experiment data (CSVs) for this suite
 EXPERIMENTS_ROOT_DIR="EXPERIMENTS"
-EXPERIMENT_NAME="04_all_other_schedulers" # Name for this experiment suite
+# EXPERIMENT_NAME="04_all_other_schedulers" # Name for this experiment suite
+EXPERIMENT_NAME="05_longer_iterations"
 # Base directories for results and plots - scheduler subdirectories will be created here
 RESULTS_BASE_DIR="${EXPERIMENTS_ROOT_DIR}/${EXPERIMENT_NAME}/results"
 PLOTS_BASE_DIR="${EXPERIMENTS_ROOT_DIR}/${EXPERIMENT_NAME}/plots"
@@ -32,22 +33,22 @@ SCHEDULERS=(
     # "chunked_rr"
     # "locality_block"
     # "feedback"
-    "workstealing"
+    # "workstealing"
     # "dynamic"
     # "bandit"
-    # "adaptive_lb"
+    "adaptive_lb"
 )
 
 # Dispatch modes to test for spmv_cli
 DISPATCH_MODES=("single" "multi") # Note: 'dynamic' scheduler's behavior is not affected by this flag.
 
 NUM_WARMUP_RUNS=5
-NUM_TIMED_RUNS=10
+NUM_TIMED_RUNS=25
 
 # Plotting script configuration
 PYTHON_EXE="${PYTHON_EXE:-python3}" # Use system python3 or specify an alternative
 PLOT_SCRIPT_PATH="./plot_exp02_gantt.py" # Reusing the modified Exp02 plotter
-ITERATION_TO_PLOT=9 # Which timed iteration index to plot (0 for the first, 9 for the last of 10 timed runs)
+ITERATION_TO_PLOT=24 # Which timed iteration index to plot (0 for the first, 9 for the last of 10 timed runs)
 FONT_SCALE_PLOT=1.2
 
 # --- Preparation ---
