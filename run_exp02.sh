@@ -29,7 +29,7 @@ NUM_TIMED_RUNS=10
 # Plotting script configuration
 PYTHON_EXE="${PYTHON_EXE:-python3}" # Use system python3 or specify an alternative
 PLOT_SCRIPT_PATH="./plot_exp02_gantt.py" # Script from exp01
-ITERATION_TO_PLOT=9 # Which timed iteration index to plot (0 for the first)
+ITERATION_TO_PLOT=0 # Which timed iteration index to plot (0 for the first)
 FONT_SCALE_PLOT=1.2
 
 # --- Preparation ---

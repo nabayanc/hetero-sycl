@@ -33,11 +33,11 @@ def get_device_color(device_label, color_index):
     return DEFAULT_COLOR_CYCLE[color_index % len(DEFAULT_COLOR_CYCLE)]
 
 
-def plot_feedback_experiment_gantt(
+def plot_scheduler_experiment_gantt(
     summary_csv_filepath,
     devices_csv_filepath,
     plots_dir_arg,
-    experiment_name_for_title, # e.g., "Experiment 02 Feedback"
+    experiment_name_prefix_for_title, # e.g., "Experiment04_static_block"
     iteration_to_plot=0,
     font_scale=1.3
 ):
@@ -60,16 +60,30 @@ def plot_feedback_experiment_gantt(
         print(f"  Error reading devices CSV {devices_csv_filepath}: {e}. Skipping.")
         return
 
-    iter_df = devices_df[devices_df['timed_iteration_idx'] == iteration_to_plot].copy()
+    # Filter devices_df for the selected iteration
+    # Check for 'timed_iteration_idx' (Exp01/03/02) or 'iteration' (suite script)
+    iteration_col_name = 'timed_iteration_idx'
+    if iteration_col_name not in devices_df.columns and 'iteration' in devices_df.columns:
+         iteration_col_name = 'iteration'
+    elif iteration_col_name not in devices_df.columns:
+         print(f"  Error: Could not find iteration column ('timed_iteration_idx' or 'iteration') in {devices_csv_filepath}. Skipping plot.")
+         return
+
+    iter_df = devices_df[devices_df[iteration_col_name] == iteration_to_plot].copy()
     if iter_df.empty:
         original_iter_to_plot = iteration_to_plot
+        # Fallback: try iteration 0 if the requested one isn't found
         iteration_to_plot = 0
-        iter_df = devices_df[devices_df['timed_iteration_idx'] == iteration_to_plot].copy()
+        iter_df = devices_df[devices_df[iteration_col_name] == iteration_to_plot].copy()
         if iter_df.empty:
             print(f"  No data for iter {original_iter_to_plot} or 0 in {devices_csv_filepath}. Skipping plot.")
             return
         else:
             print(f"  No data for iter {original_iter_to_plot}, using iter 0 for {summary_csv_filepath}.")
+            # Update the variable used in the title later
+            actual_iteration_plotted = 0
+    else:
+        actual_iteration_plotted = iteration_to_plot
 
 
     critical_cols = ['host_dispatch_offset_ms', 'kernel_duration_ms', 'device_name_label', 'row_begin', 'row_end', 'device_exp_idx']
@@ -82,13 +96,13 @@ def plot_feedback_experiment_gantt(
     iter_df['kernel_duration_ms'] = pd.to_numeric(iter_df['kernel_duration_ms'], errors='coerce')
     iter_df.dropna(subset=['host_dispatch_offset_ms', 'kernel_duration_ms'], inplace=True)
     if iter_df.empty:
-        print(f"  No valid numeric kernel timing data for iter {iteration_to_plot} after cleaning in {devices_csv_filepath}. Skipping.")
+        print(f"  No valid numeric kernel timing data for iter {actual_iteration_plotted} after cleaning in {devices_csv_filepath}. Skipping.")
         return
 
     matrix_path = summary_data.get('matrix_path', 'UnknownMatrix')
-    # Get dispatch_mode from summary_data (new column in spmv_cli output)
+    # Get dispatch_mode and scheduler_name from summary_data
     dispatch_mode = summary_data.get('dispatch_mode', 'UnknownDispatch')
-    scheduler_name = summary_data.get('scheduler_name', 'UnknownScheduler') # Should be 'feedback'
+    scheduler_name = summary_data.get('scheduler_name', 'UnknownScheduler')
     matrix_total_rows = summary_data.get('num_rows', 0)
 
     # Get average host times from summary for context in the title
@@ -99,26 +113,42 @@ def plot_feedback_experiment_gantt(
         avg_overall_kernel_phase_wall_ms_summary = avg_kernel_submission_ms_summary + avg_kernel_sync_ms_summary
 
 
-    # Sort by device_exp_idx to ensure consistent lane ordering if labels are not perfectly ordered initially
-    # iter_df.sort_values(by='device_exp_idx', inplace=True) # device_name_label should be used for grouping
-    unique_device_labels_in_iter = sorted(iter_df['device_name_label'].unique(), key=lambda x: int(re.search(r'dev(\d+)_', x).group(1)))
+    # Sort devices by device_exp_idx for consistent lane ordering
+    # Also ensure 'device_name_label' is used for the y-axis labels if available
+    unique_device_exp_indices = sorted(iter_df['device_exp_idx'].unique())
+    # Map device_exp_idx to device_name_label, using the first instance found in the data
+    device_label_map = {}
+    for dev_idx in unique_device_exp_indices:
+         # Find the first row for this device index to get its label
+         label = iter_df[iter_df['device_exp_idx'] == dev_idx]['device_name_label'].iloc[0] if not iter_df[iter_df['device_exp_idx'] == dev_idx].empty else f"Device {dev_idx}"
+         device_label_map[dev_idx] = label
+
+    unique_device_labels_in_plot_order = [device_label_map[idx] for idx in unique_device_exp_indices]
 
     # Calculate actual kernel phase wall time for this specific iteration
     actual_kernel_phase_end_time_this_iter = (iter_df['host_dispatch_offset_ms'] + iter_df['kernel_duration_ms']).max()
 
 
-    work_per_device_in_iter = {
-        label: (iter_df[iter_df['device_name_label'] == label]['row_end'] - iter_df[iter_df['device_name_label'] == label]['row_begin']).sum()
-        for label in unique_device_labels_in_iter
-    }
-    work_fractions = {
-        label: (work / matrix_total_rows if matrix_total_rows > 0 else 0.05)
-        for label, work in work_per_device_in_iter.items()
-    }
+    work_per_device_in_iter = {}
+    for dev_idx in unique_device_exp_indices:
+         dev_label = device_label_map[dev_idx]
+         work_per_device_in_iter[dev_label] = (iter_df[iter_df['device_exp_idx'] == dev_idx].apply(
+             lambda row: row['row_end'] - row['row_begin'], axis=1
+         ).sum())
 
-    num_devices_in_plot = len(unique_device_labels_in_iter)
+    if matrix_total_rows == 0:
+         print(f"  Matrix {matrix_path} has 0 rows. Bar heights will be default.")
+         work_fractions = {label: 0.05 for label in unique_device_labels_in_plot_order} # Default small height
+    else:
+        work_fractions = {
+            label: (work / matrix_total_rows if matrix_total_rows > 0 else 0)
+            for label, work in work_per_device_in_iter.items()
+        }
+
+    # --- Plotting ---
+    num_devices_in_plot = len(unique_device_exp_indices)
     if num_devices_in_plot == 0:
-        print(f"  No devices with kernel data for iteration {iteration_to_plot} in {devices_csv_filepath}. Skipping plot.")
+        print(f"  No devices with kernel data for iteration {actual_iteration_plotted} in {devices_csv_filepath}. Skipping plot.")
         return
 
     fig_height = max(5 * font_scale, (1.5 + num_devices_in_plot * 1.1) * font_scale)
@@ -134,10 +164,11 @@ def plot_feedback_experiment_gantt(
     MIN_BAR_THICKNESS = 0.20 * font_scale
     legend_handles = {}
 
-    # Use device_exp_idx for consistent color assignment if labels are tricky
-    device_exp_idx_map = {label: idx for idx, label in enumerate(unique_device_labels_in_iter)}
+    # Use device_exp_idx for consistent color assignment
+    device_color_index_map = {dev_idx: i for i, dev_idx in enumerate(unique_device_exp_indices)}
 
-    for device_label in unique_device_labels_in_iter: # Iterate in sorted order
+    for i, dev_idx in enumerate(unique_device_exp_indices): # Iterate in sorted index order
+        device_label = device_label_map.get(dev_idx, f"Device {dev_idx}")
         device_lane_y_val = current_y_lane_center
         y_ticks_pos.append(device_lane_y_val)
         y_tick_labels.append(device_label)
@@ -146,7 +177,7 @@ def plot_feedback_experiment_gantt(
         bar_render_height = MIN_BAR_THICKNESS + thickness_fraction * (MAX_BAR_THICKNESS - MIN_BAR_THICKNESS)
         bar_render_height = np.clip(bar_render_height, MIN_BAR_THICKNESS, MAX_BAR_THICKNESS)
 
-        color_idx = device_exp_idx_map.get(device_label, 0) # Get consistent index for color
+        color_idx = device_color_index_map.get(dev_idx, i) # Get consistent index for color
         device_color = get_device_color(device_label, color_idx)
         if device_label not in legend_handles:
             legend_handles[device_label] = plt.Rectangle((0,0),1,1,color=device_color, alpha=0.85)
@@ -158,7 +189,7 @@ def plot_feedback_experiment_gantt(
                     left=0, color='whitesmoke', edgecolor='gainsboro', alpha=0.5, zorder=1)
 
 
-        device_chunks = iter_df[iter_df['device_name_label'] == device_label]
+        device_chunks = iter_df[iter_df['device_exp_idx'] == dev_idx].copy()
         # Sort chunks by host_dispatch_offset_ms for cleaner visualization within a lane
         device_chunks = device_chunks.sort_values(by='host_dispatch_offset_ms')
 
@@ -179,15 +210,15 @@ def plot_feedback_experiment_gantt(
     ax.set_yticklabels(y_tick_labels, fontsize=11 * font_scale)
     ax.invert_yaxis()
 
-    ax.set_xlabel(f"Time Since Host Kernel Dispatch Phase Start (ms) - Timed Iteration {iteration_to_plot}", fontsize=13 * font_scale)
+    ax.set_xlabel(f"Time Since Host Kernel Dispatch Phase Start (ms) - Timed Iteration {actual_iteration_plotted}", fontsize=13 * font_scale)
     ax.set_ylabel("Device", fontsize=13 * font_scale)
     ax.tick_params(axis='both', which='major', labelsize=11 * font_scale)
 
     matrix_basename = os.path.basename(matrix_path).replace('.mtx', '')
-    # Title uses experiment_name, scheduler, dispatch_mode, matrix
+    # Title uses experiment_name_prefix, scheduler, dispatch_mode, matrix
     title_dispatch_mode = dispatch_mode.replace("_", "-").capitalize()
-    title = (f"{experiment_name_for_title}: {scheduler_name.capitalize()} Scheduler - {title_dispatch_mode} Dispatch\n"
-             f"Matrix: {matrix_basename} (Iteration {iteration_to_plot})\n"
+    title = (f"{experiment_name_prefix_for_title}: {scheduler_name.capitalize()} Scheduler - {title_dispatch_mode} Dispatch\n"
+             f"Matrix: {matrix_basename} (Iteration {actual_iteration_plotted})\n"
              f"Avg. Host Kernel Phase (Submit+Sync) from Summary: {avg_overall_kernel_phase_wall_ms_summary:.3f}ms. "
              f"(Avg. Submit Loop: {avg_kernel_submission_ms_summary:.3f}ms, Avg. Sync Wait: {avg_kernel_sync_ms_summary:.3f}ms)")
     ax.set_title(title, fontsize=12 * font_scale, pad=20 * font_scale, loc='center')
@@ -217,7 +248,8 @@ def plot_feedback_experiment_gantt(
         plt.tight_layout(rect=[0, 0, 1 - (0.22 * font_scale), 0.90 if "\n" in title else 0.92]) # Adjusted
 
 
-    plot_filename = f"gantt_{experiment_name_for_title.lower().replace(' ','_')}_{matrix_basename}_{scheduler_name}_{dispatch_mode}_iter{iteration_to_plot}.png"
+    # Construct plot filename based on extracted info
+    plot_filename = f"gantt_{scheduler_name}_{dispatch_mode}_{matrix_basename}_iter{actual_iteration_plotted}.png"
     full_plot_path = os.path.join(plots_dir_arg, plot_filename)
     try:
         plt.savefig(full_plot_path, dpi=200)
@@ -227,28 +259,29 @@ def plot_feedback_experiment_gantt(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate Kernel-Centric Gantt charts for SpMV Experiment 02 (Feedback Scheduler).")
-    parser.add_argument('--results_dir', type=str, required=True, help="Directory containing summary (results_*) and devices (devices_*) CSV files.")
+    parser = argparse.ArgumentParser(description="Generate Kernel-Centric Gantt charts for SpMV scheduler experiments.")
+    parser.add_argument('--results_dir', type=str, required=True, help="Directory containing summary (results_*) and devices (devices_*) CSV files for a specific scheduler.")
     parser.add_argument('--plots_dir', type=str, required=True, help="Directory where plots will be saved.")
-    parser.add_argument('--experiment_name', type=str, default="Experiment02_Feedback", help="Experiment name prefix for plot titles (e.g., 'Experiment02_Feedback').")
-    parser.add_argument('--iteration_to_plot', type=int, default=0, help="Index of the timed iteration to plot (default: 0).")
-    parser.add_argument('--font_scale', type=float, default=1.2, help="Scaling factor for font sizes and plot elements.") # Adjusted default
+    parser.add_argument('--experiment_name', type=str, default="Experiment", help="Experiment name prefix for plot titles (e.g., 'Experiment04_static_block').")
+    parser.add_argument('--iteration_to_plot', type=int, default=9, help="Index of the timed iteration to plot (default: 9).")
+    parser.add_argument('--font_scale', type=float, default=1.2, help="Scaling factor for font sizes and plot elements.")
     args = parser.parse_args()
 
     os.makedirs(args.plots_dir, exist_ok=True)
 
-    # Regex to find files and extract matrix basename and dispatch mode
-    # Example filename: results_csr_r25000_c25000_d0_01_feedback_single.csv
-    file_pattern = re.compile(r"results_(?P<matrix_basename>csr_r\d+_c\d+_d\S+?)_feedback_(?P<dispatch_mode>single|multi)\.csv")
+    # Regex to find files and extract matrix basename, scheduler name, and dispatch mode
+    # This pattern matches results_matrixbasename_schedulername_dispatchmode.csv
+    file_pattern = re.compile(r"results_(?P<matrix_basename>.+?)_(?P<scheduler_name>.+?)_(?P<dispatch_mode>single|multi)\.csv")
 
-    summary_csv_files = glob.glob(os.path.join(args.results_dir, "results_*_feedback_*.csv"))
+    # Search within the provided --results_dir
+    summary_csv_files = glob.glob(os.path.join(args.results_dir, "results_*.csv"))
 
     if not summary_csv_files:
-        print(f"No summary CSV files matching '*_feedback_*.csv' found in {args.results_dir}.")
+        print(f"No summary CSV files found in {args.results_dir}.")
     else:
-        print(f"Found {len(summary_csv_files)} summary CSV files for Feedback scheduler Experiment 02.")
+        print(f"Found {len(summary_csv_files)} summary CSV files to process.")
 
-    summary_files_to_plot = []
+    files_to_plot = []
 
     for summary_csv_file in sorted(summary_csv_files):
         base_name = os.path.basename(summary_csv_file)
@@ -256,40 +289,39 @@ if __name__ == "__main__":
 
         if match:
             matrix_basename = match.group("matrix_basename")
-            dispatch_mode = match.group("dispatch_mode")
+            scheduler_name = match.group("scheduler_name") # Extracted from filename
+            dispatch_mode = match.group("dispatch_mode")   # Extracted from filename
 
             # Construct corresponding devices.csv filename
-            # devices_csr_r25000_c25000_d0_01_feedback_single.csv
-            devices_csv_file = os.path.join(args.results_dir, f"devices_{matrix_basename}_feedback_{dispatch_mode}.csv")
+            devices_csv_file = os.path.join(args.results_dir, f"devices_{matrix_basename}_{scheduler_name}_{dispatch_mode}.csv")
 
             if not os.path.exists(devices_csv_file):
                 print(f"  Warning: Devices file not found for {summary_csv_file} (expected: {devices_csv_file}). Skipping.")
                 continue
 
-            summary_files_to_plot.append({
+            files_to_plot.append({
                 "summary_path": summary_csv_file,
                 "devices_path": devices_csv_file,
-                "matrix": matrix_basename,
-                "dispatch": dispatch_mode
+                "scheduler_name_from_file": scheduler_name, # Pass extracted name
+                "dispatch_mode_from_file": dispatch_mode # Pass extracted mode
             })
         else:
             print(f"  Skipping file (does not match expected pattern): {summary_csv_file}")
 
     # Plot each found combination
-    for plot_info in summary_files_to_plot:
-        print(f"Processing Matrix: {plot_info['matrix']}, Dispatch: {plot_info['dispatch']}")
-        print(f"  Summary: {plot_info['summary_path']}")
-        print(f"  Devices: {plot_info['devices_path']}")
+    for plot_info in files_to_plot:
+        print(f"Processing files: {os.path.basename(plot_info['summary_path'])}")
 
-        plot_feedback_experiment_gantt(
+        # Pass the extracted scheduler and dispatch names to the plotting function
+        plot_scheduler_experiment_gantt(
             plot_info['summary_path'],
             plot_info['devices_path'],
             args.plots_dir,
-            args.experiment_name, # This is the overall experiment name, title will add matrix/dispatch
+            args.experiment_name, # This is the overall experiment prefix passed from run_exp04.sh
             args.iteration_to_plot,
             args.font_scale
         )
 
-    if not summary_files_to_plot:
+    if not files_to_plot:
         print("No valid summary/devices file pairs found to plot.")
-    print("\nFeedback scheduler Gantt plotting script finished.")
+    print("\nScheduler Gantt plotting script finished.")

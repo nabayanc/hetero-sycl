@@ -3,6 +3,7 @@ file(GLOB LIB_HEADERS "${PROJECT_SOURCE_DIR}/include/spmv/*.hpp")
 file(GLOB LIB_SOURCES
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/schedulers/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/schedulers/adaptive_load_balancing.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/spmv_csr.cpp")
 
 # ①  Build an OBJECT library ⇒ compiles each .cpp once, no archive stage

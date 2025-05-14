@@ -28,7 +28,7 @@ NUM_TIMED_RUNS=10
 # Plotting script configuration
 PYTHON_EXE="${PYTHON_EXE:-python3}" # Use system python3 or specify an alternative
 PLOT_SCRIPT_PATH="./plot_exp01_gantt.py" # Assuming it's in the root of the repo
-ITERATION_TO_PLOT=8 # Which timed iteration index to plot for the Gantt chart (0 for the first)
+ITERATION_TO_PLOT=9 # Which timed iteration index to plot for the Gantt chart (0 for the first)
 FONT_SCALE_PLOT=1.2 # Font scaling for plots
 
 # --- Preparation ---
