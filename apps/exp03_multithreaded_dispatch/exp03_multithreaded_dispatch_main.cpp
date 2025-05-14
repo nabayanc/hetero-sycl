@@ -11,6 +11,8 @@
 #include <iomanip>
 #include <algorithm>
 #include <map>
+#include <thread> // For std::thread
+#include <mutex>  // For std::mutex
 
 // Helper struct for USM memory per device
 struct DeviceUsmMem {
@@ -201,28 +203,108 @@ int main(int argc, char** argv) {
         TimePoint t_y_reset_end = Clock::now();
         if (!is_warmup) y_reset_times_ms_all_iters.push_back(ms_duration(t_y_reset_start, t_y_reset_end));
         
+        // --- Start of Block to Insert/Replace for Kernel Submission ---
         TimePoint iteration_dispatch_phase_start_tp = Clock::now(); // Host ref for this iter's dispatch
-        std::vector<sycl::event> kernel_exec_events_this_iter;
-        std::vector<EventDispatchContext> event_contexts_this_iter;
+        std::vector<sycl::event> kernel_exec_events_this_iter_all_threads; // Collect all events
+        std::vector<EventDispatchContext> event_contexts_this_iter_all_threads; // Collect all contexts
+        std::mutex events_mutex, contexts_mutex; // Mutexes for shared vectors
 
-        for (const auto& p : partitions) {
-            if (p.row_end <= p.row_begin) continue;
-            DeviceUsmMem* mem_ptr = p.device_mem;
-            double current_dispatch_offset_ms = ms_duration(iteration_dispatch_phase_start_tp, Clock::now());
-            sycl::event e;
-            if (mem_ptr->q.get_device().is_cpu()) {
-                e = spmv::spmv_cpu(mem_ptr->q, (p.row_end - p.row_begin), mem_ptr->rp + p.row_begin, mem_ptr->ci, mem_ptr->v, mem_ptr->x, mem_ptr->y + p.row_begin);
-            } else {
-                e = spmv::spmv_gpu(mem_ptr->q, (p.row_end - p.row_begin), mem_ptr->rp + p.row_begin, mem_ptr->ci, mem_ptr->v, mem_ptr->x, mem_ptr->y + p.row_begin);
+        // Check if multi-threading is beneficial/applicable for this configuration
+        bool use_multithreaded_dispatch = false;
+        if (selected_devices_mem.size() > 1 && 
+            (config_type == "gpu2_split" || config_type == "cpu1gpu2_split")) {
+            use_multithreaded_dispatch = true;
+        }
+
+        if (use_multithreaded_dispatch) {
+            // --- MULTI-THREADED DISPATCH for multi-device configurations ---
+            std::vector<std::thread> submission_workers;
+            
+            // Group partitions by their assigned device's experimental index.
+            // This ensures each thread handles all work for one specific device.
+            std::map<int, std::vector<WorkPartition>> parts_per_device_idx;
+            for(const auto& p : partitions) { // 'partitions' is the vector of WorkPartition
+                if (p.device_mem) { // Ensure device_mem is not null
+                    parts_per_device_idx[p.device_mem->device_exp_idx].push_back(p);
+                }
             }
-            kernel_exec_events_this_iter.push_back(e);
-            if (!is_warmup) {
-                event_contexts_this_iter.push_back({e, iter - num_warmup_runs, mem_ptr->device_exp_idx, mem_ptr->device_name_label, p.row_begin, p.row_end, current_dispatch_offset_ms});
+            
+            for(const auto& pair : parts_per_device_idx) {
+                int current_dev_exp_idx = pair.first;
+                const std::vector<WorkPartition>& device_specific_partitions = pair.second;
+                
+                DeviceUsmMem* mem_ptr_for_thread = nullptr;
+                for(auto& s_mem : selected_devices_mem){ 
+                    if(s_mem.device_exp_idx == current_dev_exp_idx) {
+                        mem_ptr_for_thread = &s_mem; 
+                        break;
+                    } 
+                }
+
+                if(!mem_ptr_for_thread || device_specific_partitions.empty()) {
+                    // Should not happen if partitions were correctly made for selected_devices_mem
+                    continue; 
+                }
+
+                submission_workers.emplace_back([&, current_dev_exp_idx, mem_ptr_for_thread, device_specific_partitions, iteration_dispatch_phase_start_tp, is_warmup, iter, num_warmup_runs]() {
+                    std::vector<sycl::event> thread_local_events;
+                    std::vector<EventDispatchContext> thread_local_contexts;
+
+                    for (const auto& p_part : device_specific_partitions) {
+                        if (p_part.row_end <= p_part.row_begin) continue;
+                        
+                        // Record host dispatch offset for this specific part
+                        // Clock::now() is taken by the thread just before its submission attempt
+                        double current_dispatch_offset_ms = ms_duration(iteration_dispatch_phase_start_tp, Clock::now());
+                        sycl::event e;
+                        if (mem_ptr_for_thread->q.get_device().is_cpu()) {
+                            e = spmv::spmv_cpu(mem_ptr_for_thread->q, (p_part.row_end - p_part.row_begin), mem_ptr_for_thread->rp + p_part.row_begin, mem_ptr_for_thread->ci, mem_ptr_for_thread->v, mem_ptr_for_thread->x, mem_ptr_for_thread->y + p_part.row_begin);
+                        } else { // GPU
+                            e = spmv::spmv_gpu(mem_ptr_for_thread->q, (p_part.row_end - p_part.row_begin), mem_ptr_for_thread->rp + p_part.row_begin, mem_ptr_for_thread->ci, mem_ptr_for_thread->v, mem_ptr_for_thread->x, mem_ptr_for_thread->y + p_part.row_begin);
+                        }
+                        thread_local_events.push_back(e);
+                        if (!is_warmup) {
+                            thread_local_contexts.push_back({e, iter - num_warmup_runs, mem_ptr_for_thread->device_exp_idx, mem_ptr_for_thread->device_name_label, p_part.row_begin, p_part.row_end, current_dispatch_offset_ms});
+                        }
+                    } // End loop over parts for this device/thread
+
+                    if(!thread_local_events.empty()){
+                        std::lock_guard<std::mutex> lock_ev(events_mutex);
+                        kernel_exec_events_this_iter_all_threads.insert(kernel_exec_events_this_iter_all_threads.end(), thread_local_events.begin(), thread_local_events.end());
+                    }
+                    if(!thread_local_contexts.empty()){
+                        std::lock_guard<std::mutex> lock_ctx(contexts_mutex);
+                        event_contexts_this_iter_all_threads.insert(event_contexts_this_iter_all_threads.end(), thread_local_contexts.begin(), thread_local_contexts.end());
+                    }
+                }); // End of lambda for submission_workers.emplace_back
+            } // End loop for creating worker threads
+
+            for (auto& worker : submission_workers) { // Wait for all host threads to finish submitting
+                worker.join(); 
+            }
+
+        } else {
+            // --- SINGLE-THREADED DISPATCH for single-device configurations (cpu1, gpu1) ---
+            // This is the original loop from exp01_baseline_spmv_main.cpp
+            for (const auto& p : partitions) {
+                if (p.row_end <= p.row_begin) continue;
+                DeviceUsmMem* mem_ptr = p.device_mem;
+                double current_dispatch_offset_ms = ms_duration(iteration_dispatch_phase_start_tp, Clock::now());
+                sycl::event e;
+                if (mem_ptr->q.get_device().is_cpu()) {
+                    e = spmv::spmv_cpu(mem_ptr->q, (p.row_end - p.row_begin), mem_ptr->rp + p.row_begin, mem_ptr->ci, mem_ptr->v, mem_ptr->x, mem_ptr->y + p.row_begin);
+                } else {
+                    e = spmv::spmv_gpu(mem_ptr->q, (p.row_end - p.row_begin), mem_ptr->rp + p.row_begin, mem_ptr->ci, mem_ptr->v, mem_ptr->x, mem_ptr->y + p.row_begin);
+                }
+                kernel_exec_events_this_iter_all_threads.push_back(e);
+                if (!is_warmup) {
+                    event_contexts_this_iter_all_threads.push_back({e, iter - num_warmup_runs, mem_ptr->device_exp_idx, mem_ptr->device_name_label, p.row_begin, p.row_end, current_dispatch_offset_ms});
+                }
             }
         }
-        TimePoint actual_kernel_submission_phase_end_tp = Clock::now();
+        TimePoint actual_kernel_submission_phase_end_tp = Clock::now(); // Host is done submitting
         
-        sycl::event::wait_and_throw(kernel_exec_events_this_iter);
+        sycl::event::wait_and_throw(kernel_exec_events_this_iter_all_threads); // Wait for device kernels
         TimePoint actual_kernel_sync_phase_end_tp = Clock::now();
 
         if (!is_warmup) {
@@ -231,26 +313,39 @@ int main(int argc, char** argv) {
             overall_kernel_phase_wall_times_ms_all_iters.push_back(ms_duration(iteration_dispatch_phase_start_tp, actual_kernel_sync_phase_end_tp));
 
             std::vector<double> current_iter_device_total_kernel_event_time(selected_devices_mem.size(), 0.0);
-            for(const auto& ctx : event_contexts_this_iter) {
+            // Sort contexts by device_exp_idx and then row_begin if strict order is needed for profiling display,
+            // but for populating all_kernel_dispatch_details, the order of processing contexts doesn't strictly matter.
+            // If event_contexts_this_iter_all_threads might be populated out of partition order by threads,
+            // sorting might be good practice before processing, though not strictly necessary for sum.
+            // std::sort(event_contexts_this_iter_all_threads.begin(), ... ); // Optional sort
+
+            for(const auto& ctx : event_contexts_this_iter_all_threads) {
                 double kernel_event_time_ms = 0.0;
+                // uint64_t cmd_start_ns = 0; // Not strictly needed for host_dispatch_offset plot
                 try {
-                     uint64_t cmd_start_ns = ctx.event.get_profiling_info<sycl::info::event_profiling::command_start>();
-                     uint64_t cmd_end_ns   = ctx.event.get_profiling_info<sycl::info::event_profiling::command_end>();
-                     kernel_event_time_ms = static_cast<double>(cmd_end_ns - cmd_start_ns) * 1e-6;
+                     uint64_t cmd_s = ctx.event.get_profiling_info<sycl::info::event_profiling::command_start>();
+                     uint64_t cmd_e   = ctx.event.get_profiling_info<sycl::info::event_profiling::command_end>();
+                     kernel_event_time_ms = static_cast<double>(cmd_e - cmd_s) * 1e-6;
                 } catch (const sycl::exception& e) {
-                    std::cerr << "Warning: Profiling info error iter " << ctx.timed_iter_idx << " dev " << ctx.dev_name_label << ": " << e.what() << std::endl;
+                    std::cerr << "Warning: Profiling info error in iter " << ctx.timed_iter_idx 
+                              << " for device " << ctx.dev_name_label << " (exp_idx " << ctx.dev_exp_idx << "). SYCL what(): " << e.what() << std::endl;
+                    kernel_event_time_ms = 0.0; // Assign a default/error value
                 }
+                
                 current_iter_device_total_kernel_event_time[ctx.dev_exp_idx] += kernel_event_time_ms;
+                
                 all_kernel_dispatch_details.push_back({
                     ctx.timed_iter_idx, ctx.dev_exp_idx, ctx.dev_name_label,
                     ctx.p_row_begin, ctx.p_row_end,
-                    ctx.dispatch_offset_ms_val, kernel_event_time_ms
+                    ctx.dispatch_offset_ms_val, // This is the crucial host_dispatch_offset_ms
+                    kernel_event_time_ms
                 });
             }
             for(size_t d_idx=0; d_idx < selected_devices_mem.size(); ++d_idx) {
                 per_device_sycl_kernel_event_times_ms[d_idx].push_back(current_iter_device_total_kernel_event_time[d_idx]);
             }
         }
+        // --- End of Block to Insert/Replace ---
         
         std::vector<float> h_y_result_this_iter(A.nrows); 
         std::vector<sycl::event> d2h_events;

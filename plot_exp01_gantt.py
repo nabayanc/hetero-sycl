@@ -1,180 +1,255 @@
+#!/usr/bin/env python3
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
 import glob
-import re # For parsing column names
+import re
+import argparse
+import numpy as np
 
-# --- Configuration ---
-EXPERIMENT_ACRONYM = "exp01" # Used for subdirectories if needed, matching C++ app structure
-EXPERIMENT_NAME = "01_baseline_spmv"
-RESULTS_DIR = f"EXPERIMENTS/{EXPERIMENT_NAME}/results/"
-PLOTS_BASE_DIR = "PLOTS"
-PLOTS_DIR = f"{PLOTS_BASE_DIR}/{EXPERIMENT_NAME}/"
+# Consistent Color Scheme
+PREDEFINED_DEVICE_COLORS = {
+    "dev0_GPU": "#1f77b4", # Blue
+    "dev1_GPU": "#ff7f0e", # Orange
+    "dev2_GPU": "#2ca02c", # Green (used for cpu1gpu2_split's second GPU)
+    "dev0_CPU": "#d62728", # Red
+    "dev1_CPU": "#9467bd", # Purple (if a second CPU)
+    # For host phases (if we were to plot them separately again, not used for device bars)
+    # "Host_Y-Reset": "#8c564b",
+    # "Host_Kernel-Submit": "#e377c2",
+    # "Host_Kernel-Sync": "#7f7f7f",
+    # "Host_D2H-Copy": "#bcbd22",
+    # "Host_Scheduling": "#17becf"
+}
+DEFAULT_COLOR_CYCLE = plt.cm.get_cmap('tab20').colors # Using a perceptually uniform colormap
 
-# Ensure the plot directory exists
-os.makedirs(PLOTS_DIR, exist_ok=True)
-
-def get_work_splits(config_type, num_rows, num_devices_in_config):
+def get_device_color(device_label, color_index):
     """
-    Determines the number of rows processed by each device based on config_type.
-    Returns a list of row counts for each device in the order they appear in CSV columns.
+    Determines a consistent color for a device label.
+    Uses PREDEFINED_DEVICE_COLORS if a match is found, otherwise cycles through DEFAULT_COLOR_CYCLE.
     """
-    splits = []
-    if num_devices_in_config == 0:
-        return []
-
-    if config_type == "cpu1" or config_type == "gpu1":
-        if num_devices_in_config == 1:
-            splits = [num_rows]
-    elif config_type == "gpu2_split":
-        if num_devices_in_config == 2:
-            rows_per_device = num_rows // 2
-            splits = [rows_per_device, num_rows - rows_per_device] # GPU0, GPU1
-    elif config_type == "cpu1gpu2_split":
-        if num_devices_in_config == 3:
-            rows_per_device = num_rows // 3
-            splits = [rows_per_device, rows_per_device, num_rows - 2 * rows_per_device] # CPU0, GPU0, GPU1
+    # Try direct match first (case sensitive)
+    if device_label in PREDEFINED_DEVICE_COLORS:
+        return PREDEFINED_DEVICE_COLORS[device_label]
     
-    if not splits or len(splits) != num_devices_in_config:
-        # Fallback or error: if logic doesn't match, distribute somewhat evenly or error
-        print(f"Warning: Could not determine exact work split for {config_type} with {num_devices_in_config} devices. Distributing rows evenly.")
-        if num_devices_in_config > 0:
-            base_rows = num_rows // num_devices_in_config
-            remainder = num_rows % num_devices_in_config
-            splits = [base_rows + (1 if i < remainder else 0) for i in range(num_devices_in_config)]
-        else:
-            return []
-            
-    return splits
+    # Fallback logic based on common patterns in device_label
+    # This helps assign somewhat consistent colors if exact labels change slightly
+    # but device types and indices are present.
+    lower_label = device_label.lower()
+    if "gpu" in lower_label:
+        if "dev0" in lower_label: return PREDEFINED_DEVICE_COLORS.get("dev0_GPU", DEFAULT_COLOR_CYCLE[0])
+        if "dev1" in lower_label: return PREDEFINED_DEVICE_COLORS.get("dev1_GPU", DEFAULT_COLOR_CYCLE[1])
+        if "dev2" in lower_label: return PREDEFINED_DEVICE_COLORS.get("dev2_GPU", DEFAULT_COLOR_CYCLE[2])
+        # Generic GPU color from cycle if specific index not matched
+        return DEFAULT_COLOR_CYCLE[color_index % 3] # Cycle through first few for GPUs
+    if "cpu" in lower_label:
+        if "dev0" in lower_label: return PREDEFINED_DEVICE_COLORS.get("dev0_CPU", DEFAULT_COLOR_CYCLE[3])
+        # Generic CPU color from cycle, offset to avoid clash with initial GPU colors
+        return DEFAULT_COLOR_CYCLE[(3 + color_index) % len(DEFAULT_COLOR_CYCLE)] 
+        
+    # Absolute fallback: cycle through default colors
+    return DEFAULT_COLOR_CYCLE[color_index % len(DEFAULT_COLOR_CYCLE)]
 
 
-def plot_gantt_chart(csv_filepath):
-    """
-    Generates and saves a Gantt chart from a single CSV results file.
-    """
+def plot_kernel_centric_gantt(
+    summary_csv_filepath,
+    devices_csv_filepath,
+    plots_dir_arg,
+    experiment_name_for_title, 
+    iteration_to_plot=0,
+    font_scale=1.3
+):
     try:
-        df = pd.read_csv(csv_filepath)
-        if df.empty:
-            print(f"Warning: CSV file {csv_filepath} is empty. Skipping.")
+        summary_df = pd.read_csv(summary_csv_filepath)
+        if summary_df.empty:
+            print(f"  Skipping due to empty summary CSV: {summary_csv_filepath}")
             return
-    except pd.errors.EmptyDataError:
-        print(f"Warning: CSV file {csv_filepath} is empty or malformed. Skipping.")
-        return
+        summary_data = summary_df.iloc[0]
     except Exception as e:
-        print(f"Error reading CSV {csv_filepath}: {e}. Skipping.")
+        print(f"  Error reading summary CSV {summary_csv_filepath}: {e}. Skipping.")
         return
 
-    # Assuming one data row per CSV file for these baseline summaries
-    if len(df) > 1:
-        print(f"Warning: CSV file {csv_filepath} has multiple rows. Using the first row for plotting.")
-    data = df.iloc[0]
-
-    matrix_path = data.get('matrix_path', 'UnknownMatrix')
-    config_type = data.get('config_type', 'UnknownConfig')
-    num_rows_total = data.get('num_rows', 0)
-    avg_overall_kernel_phase_wall_ms = data.get('avg_overall_kernel_phase_wall_ms', 0)
-
-    # Dynamically find device kernel time columns and parse device info
-    device_kernel_times = [] # List of (device_label, kernel_time_ms)
-    
-    # Regex to find columns like 'avg_kernel_event_ms_dev0_cpu' or 'avg_util_dev0_gpu_pct'
-    # We want the kernel event times, not utilization for bar length
-    kernel_time_pattern = re.compile(r"avg_kernel_event_ms_(dev\d+_(?:cpu|gpu))$")
-
-    for col in df.columns:
-        match = kernel_time_pattern.match(col)
-        if match:
-            device_label_suffix = match.group(1) # e.g., "dev0_cpu"
-            kernel_time = data.get(col, 0)
-            # Prepend "Device " and capitalize type for better legend
-            parts = device_label_suffix.split('_') # devX, type
-            device_display_label = f"Device {parts[0][3:]} ({parts[1].upper()})" # "Device 0 (CPU)"
-            device_kernel_times.append({'label': device_display_label, 'time': kernel_time, 'id_suffix': device_label_suffix})
-
-    if not device_kernel_times:
-        print(f"No device kernel time columns found in {csv_filepath} (e.g., 'avg_kernel_event_ms_devX_type'). Skipping plot.")
-        return
-
-    # Sort devices for consistent plotting order (e.g., dev0, dev1, ...)
-    device_kernel_times.sort(key=lambda x: x['id_suffix'])
-    
-    num_devices_in_config = len(device_kernel_times)
-    work_splits_rows = get_work_splits(config_type, num_rows_total, num_devices_in_config)
-
-    if len(work_splits_rows) != num_devices_in_config:
-        print(f"Error: Mismatch between detected devices ({num_devices_in_config}) and work split calculation ({len(work_splits_rows)}) for {config_type}. Skipping plot for {csv_filepath}")
-        return
-
-    device_labels = [d['label'] for d in device_kernel_times]
-    kernel_times_ms = [d['time'] for d in device_kernel_times]
-
-    # --- Bar Heights (proportional to work split) ---
-    # Scale heights to be visually reasonable, max height of 0.8 for a single bar
-    # If multiple bars, they are stacked by default in y_pos
-    if num_rows_total > 0 and all(s >= 0 for s in work_splits_rows):
-        # Normalize work_splits_rows to sum to a factor that looks good (e.g., 0.8 * num_devices)
-        # or make height proportional to its fraction of total rows, scaled by a factor
-        max_work_split_for_height = max(work_splits_rows) if any(s > 0 for s in work_splits_rows) else 1
-        bar_heights = [ (ws / max_work_split_for_height) * 0.7 if max_work_split_for_height > 0 else 0.1 for ws in work_splits_rows ]
-    else:
-        bar_heights = [0.7] * num_devices_in_config # Default height if no row data
-
-    y_pos = range(len(device_labels))
-
-    fig, ax = plt.subplots(figsize=(12, 2 + num_devices_in_config * 0.8)) # Adjust fig size based on num devices
-
-    colors = plt.cm.get_cmap('viridis', num_devices_in_config) # Use a colormap
-
-    for i in range(num_devices_in_config):
-        ax.barh(y_pos[i], kernel_times_ms[i], height=bar_heights[i], left=0, 
-                label=f"{device_labels[i]}: {kernel_times_ms[i]:.2f} ms\n({work_splits_rows[i]} rows)",
-                color=colors(i / num_devices_in_config if num_devices_in_config > 1 else 0.5), 
-                edgecolor='black')
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(device_labels)
-    ax.invert_yaxis()  # Devices listed top-to-bottom
-
-    ax.set_xlabel("Average Kernel Execution Time (ms) - SYCL Event Time")
-    ax.set_ylabel("Device")
-    
-    matrix_basename = os.path.basename(matrix_path).replace('.mtx', '')
-    title = (f"SpMV Kernel Runtimes: {config_type} on {matrix_basename}\n"
-             f"Avg. Overall Kernel Phase Wall Time (Host): {avg_overall_kernel_phase_wall_ms:.2f} ms")
-    ax.set_title(title, fontsize=12)
-
-    # Set x-axis limit slightly beyond the max of overall phase or longest kernel
-    max_time_to_plot = avg_overall_kernel_phase_wall_ms
-    if kernel_times_ms:
-         max_time_to_plot = max(max_time_to_plot, max(kernel_times_ms))
-    ax.set_xlim(0, max_time_to_plot * 1.1 if max_time_to_plot > 0 else 1)
-
-
-    ax.legend(title="Device Contributions", bbox_to_anchor=(1.02, 1), loc='upper left')
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
-    plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust rect to make space for legend
-
-    # --- Save Plot ---
-    plot_filename = f"gantt_{matrix_basename}_{config_type}.png"
-    full_plot_path = os.path.join(PLOTS_DIR, plot_filename)
     try:
-        plt.savefig(full_plot_path)
-        print(f"Saved plot: {full_plot_path}")
+        devices_df = pd.read_csv(devices_csv_filepath)
+        if devices_df.empty:
+            print(f"  Skipping due to empty devices CSV: {devices_csv_filepath}")
+            return
     except Exception as e:
-        print(f"Error saving plot {full_plot_path}: {e}")
+        print(f"  Error reading devices CSV {devices_csv_filepath}: {e}. Skipping.")
+        return
+
+    iter_df = devices_df[devices_df['timed_iteration_idx'] == iteration_to_plot].copy()
+    if iter_df.empty:
+        original_iter_to_plot = iteration_to_plot
+        iteration_to_plot = 0 
+        iter_df = devices_df[devices_df['timed_iteration_idx'] == iteration_to_plot].copy()
+        if iter_df.empty:
+            print(f"  No data for iter {original_iter_to_plot} or 0 in {devices_csv_filepath}. Skipping plot.")
+            return
+        else:
+            print(f"  No data for iter {original_iter_to_plot}, using iter 0 for {summary_csv_filepath}.")
+
+    critical_cols = ['host_dispatch_offset_ms', 'kernel_duration_ms', 'device_name_label', 'row_begin', 'row_end']
+    if not all(col in iter_df.columns for col in critical_cols):
+        missing_cols = [col for col in critical_cols if col not in iter_df.columns]
+        print(f"  Devices CSV {devices_csv_filepath} missing critical columns: {missing_cols}. Skipping.")
+        return
+    
+    iter_df['host_dispatch_offset_ms'] = pd.to_numeric(iter_df['host_dispatch_offset_ms'], errors='coerce')
+    iter_df['kernel_duration_ms'] = pd.to_numeric(iter_df['kernel_duration_ms'], errors='coerce')
+    iter_df.dropna(subset=['host_dispatch_offset_ms', 'kernel_duration_ms'], inplace=True)
+    if iter_df.empty:
+        print(f"  No valid numeric kernel timing data for iter {iteration_to_plot} after cleaning. Skipping.")
+        return
+
+    matrix_path = summary_data.get('matrix_path', 'UnknownMatrix')
+    config_type = summary_data.get('config_type', 'UnknownConfig') # For Exp1/Exp03
+    scheduler_name_from_summary = summary_data.get('scheduler_name', '') # For Exp02 (spmv_cli)
+    matrix_total_rows = summary_data.get('num_rows', 0)
+    
+    avg_kernel_submission_ms_summary = summary_data.get('avg_kernel_submission_ms', 0)
+    avg_kernel_sync_ms_summary = summary_data.get('avg_kernel_sync_ms', 0)
+    avg_overall_kernel_phase_wall_ms_summary = summary_data.get('avg_overall_kernel_phase_wall_ms', 0)
+    if avg_overall_kernel_phase_wall_ms_summary < 1e-6 and (avg_kernel_submission_ms_summary > 0 or avg_kernel_sync_ms_summary > 0) :
+        avg_overall_kernel_phase_wall_ms_summary = avg_kernel_submission_ms_summary + avg_kernel_sync_ms_summary
+
+    unique_device_labels_in_iter = sorted(iter_df['device_name_label'].unique())
+    
+    work_per_device_in_iter = {
+        label: (iter_df[iter_df['device_name_label'] == label]['row_end'] - iter_df[iter_df['device_name_label'] == label]['row_begin']).sum() 
+        for label in unique_device_labels_in_iter
+    }
+    work_fractions = {
+        label: (work / matrix_total_rows if matrix_total_rows > 0 else 0.05) 
+        for label, work in work_per_device_in_iter.items()
+    }
+
+    num_devices_in_plot = len(unique_device_labels_in_iter)
+    if num_devices_in_plot == 0:
+        print(f"  No devices with kernel data for iteration {iteration_to_plot}. Skipping plot.")
+        return
+        
+    fig_height = max(5 * font_scale, (1.5 + num_devices_in_plot * 1.1) * font_scale)
+    fig, ax = plt.subplots(figsize=(17 * font_scale, fig_height)) 
+    
+    y_ticks_pos = []
+    y_tick_labels = []
+    current_y_lane_center = 0 
+    lane_spacing = 1.0 
+    max_kernel_activity_end_time_ms = 0.0
+    
+    MAX_BAR_THICKNESS = 0.75 * font_scale 
+    MIN_BAR_THICKNESS = 0.20 * font_scale
+    legend_handles = {} 
+
+    for i, device_label in enumerate(unique_device_labels_in_iter):
+        device_lane_y_val = current_y_lane_center
+        y_ticks_pos.append(device_lane_y_val)
+        y_tick_labels.append(device_label)
+
+        thickness_fraction = work_fractions.get(device_label, 0.0)
+        bar_render_height = MIN_BAR_THICKNESS + thickness_fraction * (MAX_BAR_THICKNESS - MIN_BAR_THICKNESS)
+        bar_render_height = np.clip(bar_render_height, MIN_BAR_THICKNESS, MAX_BAR_THICKNESS)
+        
+        device_color = get_device_color(device_label, i) # Call the get_color function
+        if device_label not in legend_handles: 
+            legend_handles[device_label] = plt.Rectangle((0,0),1,1,color=device_color, alpha=0.85)
+
+        # Plot background "envelope" for this device for the kernel phase
+        if avg_overall_kernel_phase_wall_ms_summary > 1e-4:
+             ax.barh(device_lane_y_val, avg_overall_kernel_phase_wall_ms_summary, 
+                    height=bar_render_height * 1.1, # Slightly larger than kernel bar
+                    left=0, color='whitesmoke', edgecolor='gainsboro', alpha=0.5, zorder=1)
+
+        device_chunks = iter_df[iter_df['device_name_label'] == device_label]
+        for _, row_chunk in device_chunks.iterrows():
+            host_dispatch_offset_ms_val = row_chunk['host_dispatch_offset_ms']
+            kernel_duration_ms_val = row_chunk['kernel_duration_ms']
+            if kernel_duration_ms_val < 1e-7: continue
+            
+            ax.barh(
+                device_lane_y_val, kernel_duration_ms_val, height=bar_render_height,
+                left=host_dispatch_offset_ms_val, 
+                color=device_color, edgecolor='black', alpha=0.85, zorder=2 
+            )
+            max_kernel_activity_end_time_ms = max(max_kernel_activity_end_time_ms, host_dispatch_offset_ms_val + kernel_duration_ms_val)
+        current_y_lane_center += lane_spacing
+
+    ax.set_yticks(y_ticks_pos)
+    ax.set_yticklabels(y_tick_labels, fontsize=11 * font_scale)
+    ax.invert_yaxis()
+
+    ax.set_xlabel(f"Time Since Host Kernel Dispatch Phase Start (ms) - Timed Iteration {iteration_to_plot}", fontsize=13 * font_scale)
+    ax.set_ylabel("Device", fontsize=13 * font_scale)
+    ax.tick_params(axis='both', which='major', labelsize=11 * font_scale)
+
+    matrix_basename = os.path.basename(matrix_path).replace('.mtx', '')
+    # Determine display_config for title (Exp1/Exp03 use config_type, Exp02 uses scheduler_name)
+    display_config = config_type if config_type and pd.notna(config_type) else scheduler_name_from_summary
+    if not display_config: display_config = "N/A" # Fallback if neither is available
+    
+    title = (f"{experiment_name_for_title}: Kernel Activity Timeline - {display_config} on {matrix_basename} (Iter {iteration_to_plot})\n"
+             f"Avg. Host Kernel Phase (Submit+Sync): {avg_overall_kernel_phase_wall_ms_summary:.3f}ms. "
+             f"(Submit Loop: {avg_kernel_submission_ms_summary:.3f}ms, Sync Wait: {avg_kernel_sync_ms_summary:.3f}ms)")
+    ax.set_title(title, fontsize=12 * font_scale, pad=15 * font_scale, loc='center')
+
+    plot_xlim_val = max(max_kernel_activity_end_time_ms, avg_overall_kernel_phase_wall_ms_summary) * 1.10
+    if plot_xlim_val <= 1e-3: plot_xlim_val = 1.0 
+    ax.set_xlim(0, plot_xlim_val)
+    
+    if legend_handles:
+        legend_labels_list = list(legend_handles.keys())
+        legend_handles_list = list(legend_handles.values())
+        
+        # Add proxy artist for the background envelope to the legend
+        legend_handles_list.append(plt.Rectangle((0,0),1,1,color='whitesmoke', alpha=0.5, ec='gainsboro'))
+        legend_labels_list.append("Host Kernel Phase Envelope (Avg.)")
+
+        ax.legend(legend_handles_list, legend_labels_list, fontsize=10 * font_scale, 
+                  bbox_to_anchor=(1.01, 1), loc='upper left', title="Legend", title_fontsize=11*font_scale)
+
+    plt.grid(axis='x', linestyle=':', alpha=0.5)
+    plt.tight_layout(rect=[0, 0, 0.78 if legend_handles else 0.95, 0.92]) 
+    
+    plot_filename = f"gantt_kernel_centric_iter{iteration_to_plot}_{matrix_basename}_{display_config.replace(' ','_')}.png"
+    full_plot_path = os.path.join(plots_dir_arg, plot_filename)
+    try:
+        plt.savefig(full_plot_path, dpi=200)
+        print(f"  Saved kernel-centric Gantt plot: {full_plot_path}")
+    except Exception as e: print(f"  Error saving plot {full_plot_path}: {e}")
     plt.close(fig)
 
 
-# --- Main Script Execution ---
 if __name__ == "__main__":
-    csv_files = glob.glob(os.path.join(RESULTS_DIR, "results_*.csv"))
-    if not csv_files:
-        print(f"No CSV files found in {RESULTS_DIR}. Ensure baseline experiments have run and produced output.")
-    else:
-        print(f"Found {len(csv_files)} CSV files to process in {RESULTS_DIR}.")
+    parser = argparse.ArgumentParser(description="Generate Kernel-Centric Gantt charts for SpMV experiments.")
+    parser.add_argument('--results_dir', type=str, required=True, help="Directory containing summary (results_*) and devices (devices_*) CSV files.")
+    parser.add_argument('--plots_dir', type=str, required=True, help="Directory where plots will be saved.")
+    parser.add_argument('--experiment_name', type=str, default="Experiment", help="Experiment name prefix for plot titles (e.g., 'Exp1', 'Exp03').")
+    parser.add_argument('--iteration_to_plot', type=int, default=0, help="Index of the timed iteration to plot (default: 0).")
+    parser.add_argument('--font_scale', type=float, default=1.3, help="Scaling factor for font sizes and plot elements.")
+    args = parser.parse_args()
 
-    for csv_file in sorted(csv_files): # Sort for consistent processing order
-        print(f"\nProcessing {csv_file}...")
-        plot_gantt_chart(csv_file)
+    os.makedirs(args.plots_dir, exist_ok=True)
+    summary_csv_files = glob.glob(os.path.join(args.results_dir, "results_*.csv"))
+
+    if not summary_csv_files: print(f"No summary CSV files found in {args.results_dir}.")
+    else: print(f"Found {len(summary_csv_files)} summary CSV files for kernel-centric Gantt plots.")
+
+    for summary_csv_file in sorted(summary_csv_files):
+        base_name = os.path.basename(summary_csv_file)
+        devices_file_base = ""
+        if base_name.startswith("results_"): devices_file_base = "devices_" + base_name[len("results_"):]
+        else: devices_file_base = "devices_" + base_name
+        devices_csv_file = os.path.join(args.results_dir, devices_file_base)
+        
+        if not os.path.exists(devices_csv_file):
+            print(f"  Warning: Devices file not found for {summary_csv_file} (expected: {devices_csv_file}). Skipping.")
+            continue
+        
+        print(f"Processing {summary_csv_file} and {devices_csv_file}...")
+        plot_kernel_centric_gantt( 
+            summary_csv_file, devices_csv_file, args.plots_dir,
+            args.experiment_name, args.iteration_to_plot, args.font_scale
+        )
     
-    print("\nPython plotting script finished.")
+    print("\nKernel-centric Gantt plotting script finished.")

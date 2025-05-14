@@ -11,44 +11,75 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <memory>   // for unique_ptr, dynamic_cast
-#include <iomanip>  // For std::fixed and std::setprecision
+#include <memory>
+#include <iomanip>
+#include <stdexcept> // For std::runtime_error for unknown args
+#include <map> // For parsing optional args
+
+// Helper to parse simple key-value command line arguments like --key value
+std::map<std::string, std::string> parse_optional_args(int argc, char** argv, int start_index) {
+    std::map<std::string, std::string> optional_args;
+    for (int i = start_index; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.rfind("--", 0) == 0) { // Check if it starts with --
+            std::string key = arg.substr(2);
+            if (i + 1 < argc) {
+                std::string next_arg = argv[i+1];
+                if (next_arg.rfind("--", 0) != 0) { // Next arg is not another key
+                    optional_args[key] = next_arg;
+                    i++; // Consume value
+                } else {
+                    optional_args[key] = "true"; // Flag-like argument
+                }
+            } else {
+                optional_args[key] = "true"; // Flag-like argument at the end
+            }
+        }
+    }
+    return optional_args;
+}
+
 
 using namespace std::chrono;
 using namespace std;
 using spmv::spmv_cpu;
 using spmv::spmv_gpu;
 
-// Helper to generate a unique short name for a device for CSV header
-std::string get_device_short_name(const sycl::device& dev, int dev_idx) {
+std::string get_device_label(const sycl::device& dev, int dev_idx) {
     std::string type = dev.is_gpu() ? "GPU" : (dev.is_cpu() ? "CPU" : "DEV");
-    // Keep it simple for now, can be enhanced to get more specific names if needed
-    // and sanitize them for CSV header.
-    return type + std::to_string(dev_idx);
+    return "dev" + std::to_string(dev_idx) + "_" + type;
 }
 
 
 int main(int argc, char** argv) {
-  if (argc != 6) {
-    std::cerr << "Usage: spmv_cli <matrix.mtx> <summary.csv> <devices.csv> <iterations> <scheduler>\n";
+  if (argc < 6) {
+    std::cerr << "Usage: spmv_cli <matrix.mtx> <summary.csv> <devices.csv> <timed_iterations> <scheduler_name> [--warmup_iterations N]\n";
     return 1;
   }
   const std::string matrix_path = argv[1];
-  const std::string summary_csv  = argv[2];
-  const std::string devices_csv  = argv[3];
-  const int         iterations   = std::stoi(argv[4]);
+  const std::string summary_csv_path  = argv[2];
+  const std::string devices_csv_path  = argv[3];
+  const int         timed_iterations   = std::stoi(argv[4]);
   const std::string sched_name   = argv[5];
 
-  // 1) Load CSR once
+  int warmup_iterations = 0;
+  std::map<std::string, std::string> optional_args = parse_optional_args(argc, argv, 6);
+  if (optional_args.count("warmup_iterations")) {
+      try {
+        warmup_iterations = std::stoi(optional_args["warmup_iterations"]);
+      } catch (const std::exception& e) {
+        std::cerr << "Error parsing --warmup_iterations: " << e.what() << std::endl;
+        return 1;
+      }
+  }
+
   auto t0_load = high_resolution_clock::now();
   auto A  = spmv::CSR::load_mm(matrix_path);
   auto t1_load = high_resolution_clock::now();
-  if (A.empty()) {
-    std::cerr << "Failed to load CSR\n";
-    return 1;
-  }
+  if (A.empty()) { std::cerr << "Failed to load CSR\n"; return 1; }
+  double load_ms = duration<double, milli>(t1_load - t0_load).count();
 
-  // 2) Discover devices & build profiling‐enabled queues
+  auto t_sycl_setup_start = high_resolution_clock::now();
   std::vector<sycl::device> discovered_devs;
   for (auto& plt : sycl::platform::get_platforms()) {
     for (auto& d : plt.get_devices()) {
@@ -57,320 +88,305 @@ int main(int argc, char** argv) {
       }
     }
   }
-
-  // Filter to ensure we have a consistent set, e.g., up to 2 GPUs and 1 CPU
-  // This part might need adjustment based on desired device selection logic.
-  // For now, let's try to use all discovered CPU/GPU devices.
-  std::vector<sycl::device> devs;
-  // Prioritize GPUs then CPUs, can be made more sophisticated
+  std::vector<sycl::device> devs; // Final list of devices to use
+  // Prioritize GPUs, then sort by name for consistent ordering if multiple of same type
+  std::vector<sycl::device> gpus, cpus;
   for(const auto& d : discovered_devs) {
-    if (d.is_gpu()) devs.push_back(d);
+    if (d.is_gpu()) gpus.push_back(d);
+    else if (d.is_cpu()) cpus.push_back(d);
   }
-  for(const auto& d : discovered_devs) {
-    if (d.is_cpu()) devs.push_back(d);
-  }
+  std::sort(gpus.begin(), gpus.end(), [](const sycl::device& a, const sycl::device& b){
+      return a.get_info<sycl::info::device::name>() < b.get_info<sycl::info::device::name>();
+  });
+  std::sort(cpus.begin(), cpus.end(), [](const sycl::device& a, const sycl::device& b){
+      return a.get_info<sycl::info::device::name>() < b.get_info<sycl::info::device::name>();
+  });
+  for(const auto& d : gpus) devs.push_back(d);
+  for(const auto& d : cpus) devs.push_back(d);
 
-  if (devs.empty()) {
-      std::cerr << "No suitable SYCL devices (GPU or CPU) found.\n";
-      return 1;
-  }
-  // Example: Limit to a certain number of devices if necessary
-  // const size_t MAX_DEVICES = 3; // Example limit
-  // if (devs.size() > MAX_DEVICES) {
-  //     devs.resize(MAX_DEVICES);
-  // }
-
-
-  std::cout << "Using " << devs.size() << " devices:" << std::endl;
-  std::vector<std::string> device_names_for_header;
+  if (devs.empty()) { std::cerr << "No suitable SYCL devices found.\n"; return 1; }
+  
+  std::vector<std::string> device_labels_for_header;
+  std::cout << "Using " << devs.size() << " devices for scheduler '" << sched_name << "':" << std::endl;
   for(size_t i = 0; i < devs.size(); ++i) {
-    std::cout << "  - " << devs[i].get_info<sycl::info::device::name>() << std::endl;
-    device_names_for_header.push_back(get_device_short_name(devs[i], i));
+    std::string label = get_device_label(devs[i], i);
+    std::cout << "  - " << label << ": " << devs[i].get_info<sycl::info::device::name>() << std::endl;
+    device_labels_for_header.push_back(label);
   }
-
 
   std::vector<sycl::queue> queues;
   for (auto& d : devs) {
-    queues.emplace_back(d,
-      sycl::property_list{
-        sycl::property::queue::in_order(),
-        sycl::property::queue::enable_profiling()
-      });
+    queues.emplace_back(d, sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
   }
+  auto t_sycl_setup_end = high_resolution_clock::now();
+  double sycl_setup_ms = duration<double, milli>(t_sycl_setup_end - t_sycl_setup_start).count();
 
-  // 3) Prepare host vectors
-  std::vector<int>   h_row_ptr = A.row_ptr;
-  std::vector<int>   h_col_idx = A.col_idx;
-  std::vector<float> h_vals    = A.vals;
   std::vector<float> h_x(A.ncols, 1.0f);
-  std::vector<float> h_y(A.nrows, 0.0f); // h_y is used as the reference for reset and final check
+  std::vector<float> h_y_zeros(A.nrows, 0.0f);
+  std::vector<float> h_y_result_buffer(A.nrows, 0.0f); // For final result and y0_check
 
-  // 4) Allocate USM and copy CSR + x,y once
+  auto t_alloc_start = high_resolution_clock::now();
   std::vector<spmv::DeviceMem> mems(devs.size());
-  auto t2_copy_init = high_resolution_clock::now();
   for (size_t i = 0; i < devs.size(); ++i) {
-    auto& q = queues[i];
-    auto& m = mems[i];
-    m.rp = sycl::malloc_device<int>(h_row_ptr.size(), q);
-    m.ci = sycl::malloc_device<int>(h_col_idx.size(), q);
-    m.v  = sycl::malloc_device<float>(h_vals.size(),    q);
+    auto& q = queues[i]; auto& m = mems[i];
+    m.rp = sycl::malloc_device<int>(A.row_ptr.size(), q);
+    m.ci = sycl::malloc_device<int>(A.col_idx.size(), q);
+    m.v  = sycl::malloc_device<float>(A.vals.size(),    q);
     m.x  = sycl::malloc_device<float>(h_x.size(),       q);
-    m.y  = sycl::malloc_device<float>(h_y.size(),       q); // Each device gets its own y buffer
-
-    q.memcpy(m.rp, h_row_ptr.data(), h_row_ptr.size()*sizeof(int));
-    q.memcpy(m.ci, h_col_idx.data(), h_col_idx.size()*sizeof(int));
-    q.memcpy(m.v,  h_vals.data(),    h_vals.size()*sizeof(float));
-    q.memcpy(m.x,  h_x.data(),       h_x.size()*sizeof(float));
-    // y is typically initialized to 0, so we might copy h_y (filled with 0s) or use q.fill()
-    q.memcpy(m.y,  h_y.data(),       h_y.size()*sizeof(float));
+    m.y  = sycl::malloc_device<float>(A.nrows,       q);
   }
   for (auto& q : queues) q.wait();
-  auto t3_copy_init = high_resolution_clock::now();
+  auto t_alloc_end = high_resolution_clock::now();
+  double usm_alloc_ms = duration<double, milli>(t_alloc_end - t_alloc_start).count();
 
-  // 5) Prepare accumulators
-  std::vector<double> sched_times_all_iters, kernel_times_all_iters, copyback_times_all_iters, total_times_all_iters;
-  std::vector<spmv::DevRecord> dev_recs; // Remains the store for all chunk-level records
+  std::vector<sycl::event> initial_transfer_events_vec;
+  initial_transfer_events_vec.reserve(devs.size() * 4);
+  auto t_initial_h2d_start = high_resolution_clock::now();
+  for (size_t i = 0; i < devs.size(); ++i) {
+    auto& q = queues[i]; auto& m = mems[i];
+    initial_transfer_events_vec.push_back(q.memcpy(m.rp, A.row_ptr.data(), A.row_ptr.size()*sizeof(int)));
+    initial_transfer_events_vec.push_back(q.memcpy(m.ci, A.col_idx.data(), A.col_idx.size()*sizeof(int)));
+    initial_transfer_events_vec.push_back(q.memcpy(m.v,  A.vals.data(),    A.vals.size()*sizeof(float)));
+    initial_transfer_events_vec.push_back(q.memcpy(m.x,  h_x.data(),       h_x.size()*sizeof(float)));
+  }
+  sycl::event::wait_and_throw(initial_transfer_events_vec);
+  auto t_initial_h2d_end = high_resolution_clock::now();
+  double initial_h2d_wall_ms = duration<double, milli>(t_initial_h2d_end - t_initial_h2d_start).count();
+  double sum_initial_h2d_event_ms = 0;
+  for(auto& e : initial_transfer_events_vec) {
+    sum_initial_h2d_event_ms += (e.get_profiling_info<sycl::info::event_profiling::command_end>() - e.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-6;
+  }
+  
+  std::vector<double> iter_y_reset_ms, iter_sched_ms, iter_kernel_submission_ms, iter_kernel_sync_ms, iter_overall_kernel_phase_ms, iter_copyback_ms, iter_total_ms;
+  std::vector<std::vector<double>> iter_device_event_ms(devs.size()); // [dev_idx][iter_event_sum]
 
-  sched_times_all_iters.reserve(iterations);
-  kernel_times_all_iters.reserve(iterations);
-  copyback_times_all_iters.reserve(iterations);
-  total_times_all_iters.reserve(iterations);
-
+  std::vector<spmv::DevRecord> all_dev_recs; // For devices.csv, accumulates over all timed iterations
   auto scheduler = spmv::make_scheduler(sched_name);
 
-  double avg_sched_dyn = 0.0, avg_kernel_dyn = 0.0, avg_copy_dyn = 0.0; // Used by dynamic scheduler
-  std::vector<float> h_y_result(A.nrows, 0.0f); // Buffer to copy result back for verification/use
+  double dyn_avg_overall_kernel_phase_ms = 0.0, dyn_total_avg_sycl_kernel_event_ms = 0.0, dyn_avg_copyback_ms = 0.0;
+  std::vector<double> dyn_avg_kernel_event_ms_per_device(devs.size(), 0.0);
 
 
-  // 6) Run
   if (scheduler->is_dynamic()) {
-    scheduler->execute_dynamic(
-      A, iterations,
-      queues,
-      mems,
-      h_y_result, // Dynamic scheduler writes its final result here
-      dev_recs,
-      avg_sched_dyn,  // This is avg wall-time of the parallel execution phase per iteration
-      avg_kernel_dyn, // This is avg sum of SYCL event kernel times per iteration
-      avg_copy_dyn    // This is avg time for final data copy-back per iteration
-    );
-  } else {
-    // Static/Feedback Path
-    for (int it = 0; it < iterations; ++it) {
-      // Reset device y buffers to 0.0f for each iteration
+      std::vector<spmv::DevRecord> dynamic_run_dev_recs; // Temp for one dynamic run call
+      scheduler->execute_dynamic(A, timed_iterations, queues, mems, h_y_result_buffer, dynamic_run_dev_recs,
+                                 dyn_avg_overall_kernel_phase_ms, dyn_total_avg_sycl_kernel_event_ms, dyn_avg_copyback_ms);
+      all_dev_recs = dynamic_run_dev_recs; // Assuming execute_dynamic populates it for all iters
+      // For dynamic, 'sched_ms' is part of overall_kernel_phase, submission/sync are not distinct like static.
+      // y_reset is handled internally by execute_dynamic's loop or not applicable if y is stateful.
+      // For now, we'll report 0 for those if dynamic.
+      for (int i = 0; i < timed_iterations; ++i) {
+          iter_y_reset_ms.push_back(0.0);
+          iter_sched_ms.push_back(0.0);
+          iter_kernel_submission_ms.push_back(0.0);
+          iter_kernel_sync_ms.push_back(0.0);
+          iter_overall_kernel_phase_ms.push_back(dyn_avg_overall_kernel_phase_ms); // Using the average reported
+          iter_copyback_ms.push_back(dyn_avg_copyback_ms); // Using the average reported
+          iter_total_ms.push_back(dyn_avg_overall_kernel_phase_ms + dyn_avg_copyback_ms);
+          
+          // Estimate per-device per-iter contributions for dynamic based on its output
+          // This is an approximation as execute_dynamic gives averages.
+          // We need to parse dynamic_run_dev_recs if we want per-iter per-device data.
+          // For simplicity, let's calculate overall avg per device from dynamic_run_dev_recs
+          // dyn_avg_kernel_event_ms_per_device will be calculated later from all_dev_recs
+      }
+  } else { // Static / Feedback Schedulers
+    for (int run_idx = 0; run_idx < warmup_iterations + timed_iterations; ++run_idx) {
+      bool is_warmup = run_idx < warmup_iterations;
+      
+      auto t_iter_start = high_resolution_clock::now();
+
+      auto t_y_reset_s = high_resolution_clock::now();
       for (size_t i = 0; i < devs.size(); ++i) {
-          // queues[i].memcpy(mems[i].y, h_y.data(), h_y.size() * sizeof(float)); // h_y contains 0.0f
-          // Or, more explicitly:
-          std::vector<float> zeros(A.nrows, 0.0f);
-          queues[i].memcpy(mems[i].y, zeros.data(), zeros.size() * sizeof(float));
+        queues[i].memcpy(mems[i].y, h_y_zeros.data(), A.nrows * sizeof(float)).wait();
       }
-      for (auto& q : queues) q.wait();
+      auto t_y_reset_e = high_resolution_clock::now();
+      if (!is_warmup) iter_y_reset_ms.push_back(duration<double, milli>(t_y_reset_e - t_y_reset_s).count());
 
-      auto t4_sched_start = high_resolution_clock::now();
+      auto t_sched_s = high_resolution_clock::now();
       auto parts = scheduler->make_plan(A.nrows, queues);
-      auto t5_sched_end = high_resolution_clock::now();
-      sched_times_all_iters.push_back(duration<double, milli>(t5_sched_end - t4_sched_start).count());
+      auto t_sched_e = high_resolution_clock::now();
+      if (!is_warmup) iter_sched_ms.push_back(duration<double, milli>(t_sched_e - t_sched_s).count());
 
-      std::vector<sycl::event> events;
-      events.reserve(parts.size());
-      size_t rec0_iter = dev_recs.size(); // Starting index in dev_recs for this iteration
+      std::vector<sycl::event> current_iter_kernel_events;
+      current_iter_kernel_events.reserve(parts.size());
+      size_t current_iter_dev_recs_start_idx = all_dev_recs.size();
 
-      auto t5_kernel_phase_start = high_resolution_clock::now(); // Start timing kernel phase
-      for (size_t pi = 0; pi < parts.size(); ++pi) {
-        auto const& p = parts[pi];
-        if (p.row_end <= p.row_begin) continue; // Skip empty parts
-
-        auto t_launch = high_resolution_clock::now(); // This is a bit redundant if t5_kernel_phase_start is used for overall
-
-        int di = -1;
-        for(size_t i = 0; i < queues.size(); ++i) {
-            if (&queues[i] == p.q) {
-                di = static_cast<int>(i);
-                break;
-            }
-        }
-        if (di == -1) {
-            std::cerr << "Error: Could not find device index for a partition." << std::endl;
-            return 1; // Or handle error appropriately
-        }
-        auto const& m = mems[di];
-
-        sycl::event e = p.q->get_device().is_gpu()
-          ? spmv_gpu(*p.q,
-                     p.row_end - p.row_begin,
-                     m.rp   + p.row_begin, // Pointer to the start of row_ptr for this partition
-                     m.ci,
-                     m.v,
-                     m.x,
-                     m.y   + p.row_begin) // Pointer to the start of y for this partition
-          : spmv_cpu(*p.q,
-                     p.row_end - p.row_begin,
-                     m.rp   + p.row_begin,
-                     m.ci,
-                     m.v,
-                     m.x,
-                     m.y   + p.row_begin);
-        
-        events.push_back(e);
-        // launch_ms in DevRecord is time from kernel_phase_start to launch submit time
-        dev_recs.push_back({
-          it, di,
-          p.row_begin,
-          p.row_end,
-          duration<double,milli>(high_resolution_clock::now() - t5_kernel_phase_start).count(), // time since kernel phase start
-          0.0 // kernel_ms will be filled later
-        });
-      }
-
-      sycl::event::wait_and_throw(events); // Wait for all kernels in this iteration
-      auto t6_kernel_phase_end = high_resolution_clock::now();
-      kernel_times_all_iters.push_back(duration<double, milli>(t6_kernel_phase_end - t5_kernel_phase_start).count());
-
-      for (size_t ei = 0; ei < events.size(); ++ei) {
-        auto& e = events[ei];
-        uint64_t s = e.get_profiling_info<sycl::info::event_profiling::command_start>();
-        uint64_t t = e.get_profiling_info<sycl::info::event_profiling::command_end>();
-        dev_recs[rec0_iter + ei].kernel_ms = double(t - s) * 1e-6;
-      }
-
-      auto t6_copyback_start = high_resolution_clock::now();
-      // Copy back y from device to host for this iteration (typically only one part contributes to final h_y_result)
-      // For SpMV, each part computes a section of y. We need to assemble it.
-      std::fill(h_y_result.begin(), h_y_result.end(), 0.0f); // Clear host result buffer
+      auto t_kernel_sub_s = high_resolution_clock::now();
       for (size_t pi = 0; pi < parts.size(); ++pi) {
         auto const& p = parts[pi];
         if (p.row_end <= p.row_begin) continue;
-
         int di = -1;
-        for(size_t i = 0; i < queues.size(); ++i) {
-            if (&queues[i] == p.q) {
-                di = static_cast<int>(i);
-                break;
-            }
+        for(size_t i=0; i<queues.size(); ++i) if(&queues[i] == p.q) {di=i; break;}
+        if (di == -1) throw std::runtime_error("Partition queue not found in device list");
+        auto const& m = mems[di];
+        sycl::event e = p.q->get_device().is_gpu() ?
+          spmv_gpu(*p.q, p.row_end-p.row_begin, m.rp+p.row_begin, m.ci, m.v, m.x, m.y+p.row_begin) :
+          spmv_cpu(*p.q, p.row_end-p.row_begin, m.rp+p.row_begin, m.ci, m.v, m.x, m.y+p.row_begin);
+        current_iter_kernel_events.push_back(e);
+        if (!is_warmup) {
+          all_dev_recs.push_back({run_idx - warmup_iterations, di, p.row_begin, p.row_end, 
+                                duration<double,milli>(high_resolution_clock::now() - t_kernel_sub_s).count(), 0.0});
         }
-        // Copy the relevant part of y from mems[di].y to h_y_result
-        queues[di].memcpy(
-          h_y_result.data() + p.row_begin,
-          mems[di].y + p.row_begin,
-          (p.row_end - p.row_begin) * sizeof(float)
-        ).wait(); // Wait for this copy
       }
-      auto t7_copyback_end = high_resolution_clock::now();
-      copyback_times_all_iters.push_back(duration<double, milli>(t7_copyback_end - t6_copyback_start).count());
+      auto t_kernel_sub_e = high_resolution_clock::now();
+      if (!is_warmup) iter_kernel_submission_ms.push_back(duration<double, milli>(t_kernel_sub_e - t_kernel_sub_s).count());
       
-      total_times_all_iters.push_back(
-          sched_times_all_iters.back() +
-          kernel_times_all_iters.back() +
-          copyback_times_all_iters.back());
-
-      if (sched_name == "feedback") {
-        std::vector<double> times_feedback(devs.size(), 0.0);
-        for (size_t r_idx = rec0_iter; r_idx < dev_recs.size(); ++r_idx) {
-          if (dev_recs[r_idx].iter == it) { // Ensure it's from the current iteration
-            times_feedback[dev_recs[r_idx].dev_idx] += dev_recs[r_idx].kernel_ms;
-          }
+      sycl::event::wait_and_throw(current_iter_kernel_events);
+      auto t_kernel_sync_e = high_resolution_clock::now();
+      if (!is_warmup) {
+        iter_kernel_sync_ms.push_back(duration<double, milli>(t_kernel_sync_e - t_kernel_sub_e).count());
+        iter_overall_kernel_phase_ms.push_back(duration<double, milli>(t_kernel_sync_e - t_kernel_sub_s).count());
+        
+        std::vector<double> iter_dev_event_sum(devs.size(), 0.0);
+        for (size_t ei = 0; ei < current_iter_kernel_events.size(); ++ei) {
+          auto& ev = current_iter_kernel_events[ei];
+          double kernel_event_time = (ev.get_profiling_info<sycl::info::event_profiling::command_end>() - 
+                                     ev.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-6;
+          all_dev_recs[current_iter_dev_recs_start_idx + ei].kernel_ms = kernel_event_time;
+          iter_dev_event_sum[all_dev_recs[current_iter_dev_recs_start_idx + ei].dev_idx] += kernel_event_time;
         }
-        scheduler->update_times(times_feedback);
+        for(size_t i=0; i<devs.size(); ++i) iter_device_event_ms[i].push_back(iter_dev_event_sum[i]);
       }
+      
+      if (sched_name == "feedback" && !current_iter_kernel_events.empty()) {
+          std::vector<double> times_feedback(devs.size(), 0.0);
+          // This part requires careful indexing if multiple parts map to same device
+          // The logic from exp01 for feedback was summing per device from dev_recs of that iteration
+          // For spmv_cli, we can use iter_dev_event_sum from just above if is_warmup is false
+          // or recalculate if needed for warmup feedback too
+          if(!is_warmup && iter_device_event_ms[0].size() > 0) { // check if we have data for current timed iter
+            for(size_t i=0; i<devs.size(); ++i) times_feedback[i] = iter_device_event_ms[i].back();
+          } else { // Fallback for warmup or if data not ready: recalculate based on current events
+            std::fill(times_feedback.begin(), times_feedback.end(), 0.0);
+            for (size_t ei = 0; ei < current_iter_kernel_events.size(); ++ei) {
+                auto& ev = current_iter_kernel_events[ei];
+                double kt = (ev.get_profiling_info<sycl::info::event_profiling::command_end>() - 
+                             ev.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-6;
+                // Find device index for this event's queue (parts[ei].q)
+                int event_dev_idx = -1;
+                for(size_t q_idx=0; q_idx < queues.size(); ++q_idx) if(parts[ei].q == &queues[q_idx]) event_dev_idx = q_idx;
+                if(event_dev_idx != -1) times_feedback[event_dev_idx] += kt;
+            }
+          }
+          scheduler->update_times(times_feedback);
+      }
+
+      auto t_copyback_s = high_resolution_clock::now();
+      std::fill(h_y_result_buffer.begin(), h_y_result_buffer.end(), 0.0f);
+      for (size_t pi = 0; pi < parts.size(); ++pi) {
+        auto const& p = parts[pi];
+        if (p.row_end <= p.row_begin) continue;
+        int di = -1;
+        for(size_t i=0; i<queues.size(); ++i) if(&queues[i] == p.q) {di=i; break;}
+        queues[di].memcpy(h_y_result_buffer.data() + p.row_begin, mems[di].y + p.row_begin, (p.row_end - p.row_begin) * sizeof(float)).wait();
+      }
+      auto t_copyback_e = high_resolution_clock::now();
+      if (!is_warmup) iter_copyback_ms.push_back(duration<double, milli>(t_copyback_e - t_copyback_s).count());
+      
+      if (!is_warmup) iter_total_ms.push_back(duration<double, milli>(high_resolution_clock::now() - t_iter_start).count());
     }
   }
 
-  // 7) Calculate averages and other summary metrics
-  double load_ms = duration<double, milli>(t1_load - t0_load).count();
-  double copy_init_ms = duration<double, milli>(t3_copy_init - t2_copy_init).count();
+  auto calculate_avg = [&](const std::vector<double>& v) {
+    if (v.empty()) return 0.0;
+    return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+  };
 
-  double avg_sched_ms_summary, avg_kernel_ms_summary, avg_copyback_ms_summary, avg_total_ms_summary;
-
-  std::vector<double> avg_device_utilization_pct(devs.size(), 0.0);
-  std::vector<double> total_kernel_ms_per_device(devs.size(), 0.0);
-  double total_kernel_phase_duration_all_iters = 0.0;
+  double avg_y_reset_ms = calculate_avg(iter_y_reset_ms);
+  double avg_sched_ms = calculate_avg(iter_sched_ms);
+  double avg_kernel_submission_ms = calculate_avg(iter_kernel_submission_ms);
+  double avg_kernel_sync_ms = calculate_avg(iter_kernel_sync_ms);
+  double avg_overall_kernel_phase_ms = calculate_avg(iter_overall_kernel_phase_ms);
+  double avg_copyback_ms = calculate_avg(iter_copyback_ms);
+  double avg_total_iter_ms = calculate_avg(iter_total_ms);
+  
+  std::vector<double> avg_kernel_event_ms_devX_type(devs.size(), 0.0);
+  double total_avg_sycl_kernel_event_ms = 0;
 
   if (scheduler->is_dynamic()) {
-    avg_sched_ms_summary = avg_sched_dyn; // This is avg wall-time of parallel execution phase
-    avg_kernel_ms_summary = avg_kernel_dyn; // This is avg sum of SYCL event kernel times
-    avg_copyback_ms_summary = avg_copy_dyn;
-    avg_total_ms_summary = avg_sched_ms_summary + avg_copyback_ms_summary; // Total is trickier for dynamic, sum of phases
+      avg_overall_kernel_phase_ms = dyn_avg_overall_kernel_phase_ms;
+      total_avg_sycl_kernel_event_ms = dyn_total_avg_sycl_kernel_event_ms; // This is already a sum for dynamic
+      avg_copyback_ms = dyn_avg_copyback_ms;
+      avg_total_iter_ms = avg_overall_kernel_phase_ms + avg_copyback_ms; // Approximation for dynamic total
+      // Calculate avg_kernel_event_ms_devX_type from all_dev_recs for dynamic
+      std::vector<double> sum_event_ms_per_device(devs.size(), 0.0);
+      std::vector<int> count_event_ms_per_device(devs.size(), 0); // This isn't quite right for averaging per-iteration sums
+                                                                   // For dynamic, all_dev_recs holds all chunks.
+                                                                   // We need a better way to get per-device contribution to total_avg_sycl_kernel_event_ms
+                                                                   // If dyn_total_avg_sycl_kernel_event_ms is the sum of SYCL times for ONE iter,
+                                                                   // and we need to break it down, this requires more info from execute_dynamic or parsing dev_recs.
+                                                                   // For now, use an approximation or leave some device specific breakdown as N/A for dynamic if too complex.
+      // Let's assume all_dev_recs for dynamic contains per-chunk kernel_ms for all timed_iterations
+      // Sum them up and divide by timed_iterations to get average sum for that device.
+      for(const auto& rec : all_dev_recs) {
+          if(rec.dev_idx >= 0 && rec.dev_idx < devs.size()){
+              sum_event_ms_per_device[rec.dev_idx] += rec.kernel_ms;
+          }
+      }
+      for(size_t i=0; i < devs.size(); ++i) {
+          if(timed_iterations > 0) avg_kernel_event_ms_devX_type[i] = sum_event_ms_per_device[i] / timed_iterations;
+      }
+      // Note: total_avg_sycl_kernel_event_ms from execute_dynamic is likely the sum across devices for ONE iteration.
+      // The CSV asks for sum of *averages*. This implies we average each device's contribution first, then sum.
+      // So, for dynamic, total_avg_sycl_kernel_event_ms should be sum of avg_kernel_event_ms_devX_type.
+      total_avg_sycl_kernel_event_ms = std::accumulate(avg_kernel_event_ms_devX_type.begin(), avg_kernel_event_ms_devX_type.end(), 0.0);
 
-    // Calculate utilization for dynamic
-    for(const auto& rec : dev_recs) {
-        if(rec.dev_idx >= 0 && rec.dev_idx < devs.size()) {
-            total_kernel_ms_per_device[rec.dev_idx] += rec.kernel_ms;
-        }
-    }
-    total_kernel_phase_duration_all_iters = avg_sched_dyn * iterations; // Total time spent in the parallel execution phase
-    if (total_kernel_phase_duration_all_iters > 0) {
-        for(size_t i=0; i < devs.size(); ++i) {
-            avg_device_utilization_pct[i] = (total_kernel_ms_per_device[i] / total_kernel_phase_duration_all_iters) * 100.0;
-        }
-    }
 
-  } else { // Static/Feedback
-    avg_sched_ms_summary = std::accumulate(sched_times_all_iters.begin(), sched_times_all_iters.end(), 0.0) / iterations;
-    avg_kernel_ms_summary = std::accumulate(kernel_times_all_iters.begin(), kernel_times_all_iters.end(), 0.0) / iterations;
-    avg_copyback_ms_summary = std::accumulate(copyback_times_all_iters.begin(), copyback_times_all_iters.end(), 0.0) / iterations;
-    avg_total_ms_summary = std::accumulate(total_times_all_iters.begin(), total_times_all_iters.end(), 0.0) / iterations;
-
-    // Calculate utilization for static/feedback
-    for(const auto& rec : dev_recs) {
-        if(rec.dev_idx >= 0 && rec.dev_idx < devs.size()) {
-            total_kernel_ms_per_device[rec.dev_idx] += rec.kernel_ms;
-        }
-    }
-    total_kernel_phase_duration_all_iters = std::accumulate(kernel_times_all_iters.begin(), kernel_times_all_iters.end(), 0.0);
-    if (total_kernel_phase_duration_all_iters > 0) {
-        for(size_t i=0; i < devs.size(); ++i) {
-            avg_device_utilization_pct[i] = (total_kernel_ms_per_device[i] / total_kernel_phase_duration_all_iters) * 100.0;
-        }
+  } else { // Static
+      for(size_t i=0; i<devs.size(); ++i) {
+        avg_kernel_event_ms_devX_type[i] = calculate_avg(iter_device_event_ms[i]);
+        total_avg_sycl_kernel_event_ms += avg_kernel_event_ms_devX_type[i];
+      }
+  }
+  
+  std::vector<double> avg_util_devX_type_pct(devs.size(), 0.0);
+  if (avg_overall_kernel_phase_ms > 1e-9) {
+    for(size_t i=0; i<devs.size(); ++i) {
+      avg_util_devX_type_pct[i] = std::min(100.0, (avg_kernel_event_ms_devX_type[i] / avg_overall_kernel_phase_ms) * 100.0);
     }
   }
   
-  float y0_check = h_y_result.empty() ? 0.0f : h_y_result[0];
+  float y0_check = h_y_result_buffer.empty() ? 0.0f : h_y_result_buffer[0];
 
-
-  // 8) Write summary CSV
-  {
-    std::ofstream os(summary_csv);
-    os << std::fixed << std::setprecision(6); // Set precision for floating point numbers
-    os << "matrix,scheduler,iterations,load_ms,copy_init_ms,avg_sched_ms,avg_kernel_ms,avg_copyback_ms,avg_total_ms,y0";
-    for(size_t i = 0; i < device_names_for_header.size(); ++i) {
-        os << ",avg_util_" << device_names_for_header[i] << "_pct";
-    }
-    os << "\n";
-
-    os << matrix_path << ","
-       << sched_name   << ","
-       << iterations   << ","
-       << load_ms      << ","
-       << copy_init_ms << ","
-       << avg_sched_ms_summary    << "," // For static, this is make_plan. For dynamic, this is the parallel exec phase wall time.
-       << avg_kernel_ms_summary   << "," // For static, critical path of kernels. For dynamic, sum of actual kernel times.
-       << avg_copyback_ms_summary << ","
-       << avg_total_ms_summary    << ","
-       << y0_check;
-    for(size_t i = 0; i < avg_device_utilization_pct.size(); ++i) {
-        os << "," << avg_device_utilization_pct[i];
-    }
-    os << "\n";
+  std::ofstream os(summary_csv_path);
+  os << std::fixed << std::setprecision(6);
+  os << "matrix_path,scheduler_name,num_rows,num_cols,num_nonzeros,warmup_iterations,timed_iterations,"
+     << "load_ms,sycl_setup_ms,usm_alloc_ms,initial_h2d_wall_ms,initial_h2d_event_sum_ms,"
+     << "avg_y_reset_ms,avg_sched_ms,avg_kernel_submission_ms,avg_kernel_sync_ms,avg_overall_kernel_phase_wall_ms,"
+     << "avg_copyback_ms,avg_total_iter_ms,total_avg_sycl_kernel_event_ms,y0_check";
+  for(const auto& label : device_labels_for_header) {
+      os << ",avg_kernel_event_ms_" << label << ",avg_util_" << label << "_pct";
   }
+  os << "\n";
 
-  // 9) Write devices CSV (no changes needed here, dev_recs is populated as before)
-  {
-    std::ofstream od(devices_csv);
-    od << std::fixed << std::setprecision(6);
-    od << "iteration,dev_idx,row_begin,row_end,launch_ms,kernel_ms\n";
-    for (auto& r : dev_recs) {
-      od << r.iter      << ","
-         << r.dev_idx   << ","
-         << r.row_begin << ","
-         << r.row_end   << ","
-         << r.launch_ms << "," // For static, this is time from kernel phase start to launch. For dynamic, from iter start.
-         << r.kernel_ms << "\n";
-    }
+  os << matrix_path << "," << sched_name << "," << A.nrows << "," << A.ncols << "," << A.nnz << ","
+     << warmup_iterations << "," << timed_iterations << ","
+     << load_ms << "," << sycl_setup_ms << "," << usm_alloc_ms << "," << initial_h2d_wall_ms << "," << sum_initial_h2d_event_ms << ","
+     << avg_y_reset_ms << "," << avg_sched_ms << "," << avg_kernel_submission_ms << "," << avg_kernel_sync_ms << "," << avg_overall_kernel_phase_ms << ","
+     << avg_copyback_ms << "," << avg_total_iter_ms << "," << total_avg_sycl_kernel_event_ms << "," << y0_check;
+  for(size_t i=0; i<devs.size(); ++i) {
+      os << "," << avg_kernel_event_ms_devX_type[i] << "," << avg_util_devX_type_pct[i];
   }
+  os << "\n";
+  os.close();
 
-  std::cout << "Completed " << iterations
-            << " runs using scheduler '" << sched_name << "'\n"
-            << "  summary → " << summary_csv << "\n"
-            << "  devices → " << devices_csv << "\n";
+  std::ofstream od(devices_csv_path);
+  od << std::fixed << std::setprecision(6);
+  od << "iteration,dev_idx,row_begin,row_end,launch_ms_rel_submission_start,kernel_ms\n"; // launch_ms is relative to kernel submission phase start for static
+  for (const auto& r : all_dev_recs) {
+    od << r.iter << "," << r.dev_idx << "," << r.row_begin << "," << r.row_end << "," << r.launch_ms << "," << r.kernel_ms << "\n";
+  }
+  od.close();
+
+  std::cout << "Completed " << warmup_iterations << " warmup, " << timed_iterations << " timed runs for scheduler '" << sched_name << "' on matrix " << matrix_path << "\n"
+            << "  Summary  -> " << summary_csv_path << "\n"
+            << "  Devices  -> " << devices_csv_path << "\n";
+
+  for (size_t i = 0; i < devs.size(); ++i) {
+    sycl::free(mems[i].rp, queues[i]); sycl::free(mems[i].ci, queues[i]);
+    sycl::free(mems[i].v, queues[i]); sycl::free(mems[i].x, queues[i]);
+    sycl::free(mems[i].y, queues[i]);
+  }
   return 0;
 }
