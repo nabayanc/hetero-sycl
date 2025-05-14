@@ -32,10 +32,10 @@ SCHEDULERS=(
     # "chunked_rr"
     # "locality_block"
     # "feedback"
-    # "workstealing"
+    "workstealing"
     # "dynamic"
     # "bandit"
-    "adaptive_lb"
+    # "adaptive_lb"
 )
 
 # Dispatch modes to test for spmv_cli
@@ -47,7 +47,7 @@ NUM_TIMED_RUNS=10
 # Plotting script configuration
 PYTHON_EXE="${PYTHON_EXE:-python3}" # Use system python3 or specify an alternative
 PLOT_SCRIPT_PATH="./plot_exp02_gantt.py" # Reusing the modified Exp02 plotter
-ITERATION_TO_PLOT=0 # Which timed iteration index to plot (0 for the first, 9 for the last of 10 timed runs)
+ITERATION_TO_PLOT=9 # Which timed iteration index to plot (0 for the first, 9 for the last of 10 timed runs)
 FONT_SCALE_PLOT=1.2
 
 # --- Preparation ---

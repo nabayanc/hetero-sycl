@@ -395,7 +395,8 @@ int main(int argc, char** argv) {
         for(size_t i=0; i<final_selected_devices.size(); ++i) iter_device_sum_kernel_event_ms[i].push_back(current_iter_dev_total_kernel_event_time[i]);
       }
       
-      if (sched_name == "feedback" && !current_iter_kernel_exec_events.empty()) {
+  if ((sched_name == "feedback" || sched_name == "adaptive_lb" || sched_name == "bandit") 
+      && !current_iter_kernel_exec_events.empty()) {
           std::vector<double> times_for_feedback(final_selected_devices.size(), 0.0);
           for(const auto& ctx : current_iter_event_contexts) {
               if (ctx.dev_experimental_idx >=0 && ctx.dev_experimental_idx < final_selected_devices.size()) {

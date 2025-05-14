@@ -20,7 +20,7 @@ public:
   make_plan(int nrows, const std::vector<sycl::queue>& queues) override {
     const int D = int(queues.size());
     // tuneable chunk‐size (in rows)
-    const int CHUNK = 256;
+    const int CHUNK = 500;
 
     // 1) build the list of row‐chunks
     struct Chunk { int begin, end; };
